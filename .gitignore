@@ -1,0 +1,7 @@
+# 发布仓：这里只应该有插件代码与四份手写文件
+node_modules/
+*.log
+*.wav
+*.bak
+.DS_Store
+Thumbs.db

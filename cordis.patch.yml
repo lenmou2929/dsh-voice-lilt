@@ -1,0 +1,18 @@
+- insert:
+    - id: voice-breeze
+      name: 'dsh-voice-lilt'
+      config:
+        baseUrl: 'http://127.0.0.1:8080'
+        voice: ''
+        voicePreset: 'girl'   # 出厂音色：girl / boy；插件启动时若库里没有就自动生成并入库
+        instructions: '一位声音自然的年轻女性，语速适中，像在跟熟人说话。'
+        toneInstructions: '语气自然、口语化，句尾略收，不夸张。'
+        seed: 42
+        strength: 'medium'
+        segmentGapMs: 500
+        bufferSeconds: 0
+        maxChars: 240
+        enabled: true
+        autoStartServer: true
+        startScript: ''
+        startWaitMs: 90000
