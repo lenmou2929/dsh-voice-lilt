@@ -3042,6 +3042,7 @@ export function apply(ctx, config = {}) {
       let offPreset;
       let offSaveVoice;
       let offState;
+      let offCard;
       let offQuestion;
       let offApproval;
       let offSection;
@@ -3695,6 +3696,66 @@ export function apply(ctx, config = {}) {
         },
       });
 
+      /* ───────── ：角色卡 / 音色表 的实时读取（提示词里那份可能已被改过） ───────── */
+
+      try {
+        problems.push('tool: start tts_card');
+        offCard = ctx.tools.register({
+          name: 'tts_card',
+          description: [
+            '只读：返回**当前**的角色卡与音色表（`persona.md` 正文节选 + `cast.json` 的角色名/音色/语气），以及当前场景 id。',
+            '为什么需要它：角色卡与音色表是**文件**，用户可能在会话中途用操作面板改过；系统提示词里的那一份可能已经过期（提示词在会话内不刷新）。',
+            '**每轮开演之前、或者你怀疑设定被改过时调一次** 以它的返回为准，别把提示词里的旧卡当成现在的设定。',
+            '返回是不出声、不写盘的；`persona` 最多 6000 字（超出会被截断，截断时会带 `truncated:true`）。',
+          ].join(''),
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+          output: {
+            schema: {
+              type: 'object',
+              properties: {
+                scene: { type: 'string' },
+                persona: { type: 'string' },
+                personaBytes: { type: 'number' },
+                truncated: { type: 'boolean' },
+                cast: { type: 'array' },
+                castSize: { type: 'number' },
+                multiVoice: { type: 'boolean' },
+              },
+            },
+            render: (args, value) => {
+              const v = value || {};
+              const castText = (v.cast || []).map((item) => `${item.name}→${item.voice || '设计模式'}`).join('、');
+              return [{
+                type: 'text',
+                text: `📖 场景=${v.scene || '-'} · 角色卡 ${v.personaBytes || 0} 字${v.truncated ? '（已截断）' : ''} · 音色表 ${v.castSize || 0} 人${castText ? `：${castText}` : ''}`,
+              }];
+            },
+          },
+          async execute() {
+            const raw = String(readPersona() || '');
+            const cast = (readCast() || []).map((item) => ({
+              name: item.name,
+              voice: item.voice || '',
+              tone: item.tone || '',
+              seed: Number.isFinite(Number(item.seed)) ? Number(item.seed) : undefined,
+            }));
+            const limit = 6000;
+            return stripUndefined({
+              scene: activeSceneId() || '',
+              persona: raw.slice(0, limit),
+              personaBytes: raw.length,
+              truncated: raw.length > limit ? true : undefined,
+              cast,
+              castSize: cast.length,
+              multiVoice: !!cfg.multiVoice,
+            });
+          },
+        });
+      } catch (error) {
+        problems.push(`tool: start tts_card failed: ${(error && error.message) || error}`);
+        note('tools:card-fail', String((error && error.message) || error));
+      }
+
       } catch (error) {
         problems.push(`tools fail: ${(error && error.message) || error}`);
         note('tools:fail', String((error && error.message) || error));
@@ -3724,6 +3785,13 @@ export function apply(ctx, config = {}) {
           // 角色扮演：一套统一的优先级链，**不再按 cast 是否为空分叉**（历史提示词残留会导致自相矛盾）
           if (cfg.fallback === 'roleplay') {
             const lines = ['## 语音播报（角色扮演）', '本会话处于角色扮演模式，语音播报开启。'];
+            // **凡是会随设置变化的东西，都不能只靠提示词**——提示词在会话内不刷新（`06` 坑 18）。
+            // 这里把「以实时值为准」写成两条固定指针，模式/朗读方式/多音色/强度/角色卡都可能被中途改过。
+            lines.push([
+              '**当前设置一律以实时工具为准**（提示词里写的是**标准与规则**，不是「现在就是某一档」）：',
+              '- `tts_state`：模式 / 朗读方式（`narrationMode`）/ 多音色（`multiVoice`）/ 强度与长度 / 嗓门 / 场景；**每轮开口前调一次**。',
+              '- `tts_card`：**当前**的角色卡与音色表（它们是文件，用户可能在会话中改过）；设定与说话人名字以它为准，别拿下文那份旧卡当现状。',
+            ].join('\n'));
             if (cfg.narrationMode === 'script') {
               lines.push('**朗读方式：照本念** —— 插件按标记切分正文，**不会调用模型重写**。');
               lines.push([
@@ -3778,7 +3846,7 @@ export function apply(ctx, config = {}) {
             // 多音色下的共同规则（照本念 / 即兴都适用）。：以界面开关为准，不看 cast 是否非空
             if (cfg.multiVoice && cast.length) {
               lines.push([
-                '**多音色已开启** ',
+                '**多音色已开启**（以 `tts_state.multiVoice` 为准；若它显示已关闭，按单音色处理）：',
                 '- 调用 `speak` 时**必须用 `segments` 多段提交**，每段带 `speaker`（名字与音色表逐字一致）；单段 `text` 只会用一把嗓子。',
                 '- 剧情里的旁白、环境、心理活动也各占一段；旁白用音色表里指定的那个声音。',
                 '- 这一轮是问答或任务汇报时，用「多角色陪伴」：挑 2~3 个角色轮番或抢着把结论说出来，按角色卡的性格决定语气与抢话方式；**旁白默认不参与汇报**（除非用户要求，或场景里只有旁白 + 一个角色）。',
@@ -3786,7 +3854,7 @@ export function apply(ctx, config = {}) {
             } else if (cast.length) {
               // 单音色 + 角色扮演——设定照用，但嗓子只有一把
               lines.push([
-                '**当前是单音色播报**（多音色没有开启）：',
+                '**当前是单音色播报**（以 `tts_state.multiVoice` 为准；若它显示已开启，按多音色处理）：',
                 '- 只用当前选中的那**一把**嗓子：`speak` 不必写 `speaker`，更不要按角色分嗓子。',
                 '- 角色设定（下面的角色卡）照样生效：称呼、口吻、态度按角色来，只是声音只有一个。',
                 '- 要分段就按语气/节奏分；`segments[].tone` 仍然有用。',
@@ -3801,7 +3869,7 @@ export function apply(ctx, config = {}) {
             } else if (cfg.multiVoice) {
               // 多音色：一局剧本 = 角色卡 + 音色表，按顺序问（顺序固定，不用一次问完气氛）
               lines.push([
-                '**这个场景还没有角色卡** 先说一句「现在是一个空白场景，开始前我有几个问题想先问你~」，然后按下面的顺序问用户（一次问一条，用户答完再问下一条）：',
+                '**这个场景还没有角色卡**（先调一次 `tts_card` 核实；如果它已经有内容，就按它演，不要问下面这些问题）：先说一句「现在是一个空白场景，开始前我有几个问题想先问你~」，然后按下面的顺序问用户（一次问一条，用户答完再问下一条）：',
                 '**这一句必须由你调 `speak` 说出来**，不能只写在正文里等兜底：',
                 '`speak({text:"现在是一个空白场景，开始前我有几个问题想先问你~"})`，正文里再写第一个问题。',
                 '1. 用默认场景，还是新建一个场景？（新建就请用户起个名字）',
@@ -3815,7 +3883,7 @@ export function apply(ctx, config = {}) {
             } else {
               // （Q11）：单音色 = **全局角色卡**，没有"场景"这回事
               lines.push([
-                '**当前还没有角色卡** 单音色用的是全局 `~/.dsh/voice-breeze/persona.md`，它现在是空的。',
+                '**当前还没有角色卡**（先调一次 `tts_card` 核实；如果 `persona` 已有内容，就按它演，别再问下面这些）：单音色用的是全局 `~/.dsh/voice-breeze/persona.md`。',
                 '**先调一次 `speak`** 说一句「角色卡还是空的，先给我一个角色吧」，不要只写在正文里等兜底。',
                 '然后一次问一条，按用户走的路子来：',
                 '1. 用户直接给卡（贴 JSON / 贴设定文）→ 你整理成 Markdown，**写到 `~/.dsh/voice-breeze/persona.md`**；不要新建场景，也不要写 `scenes/`。',
@@ -3842,6 +3910,7 @@ export function apply(ctx, config = {}) {
               '**这一轮不要调用 `speak`** 正文本身就是播报内容。真调了也不会出声——这一档的 `speak` 会被忽略（返回 `skipped`），照样只念一遍正文。',
               '正文照常写给用户看：句子写完整、分段清楚就行；**不要**写「旁白：」「角色名：」这类标记（那是角色扮演的写法），也不要把路径、堆栈、表格塞进要念的句子里。',
               '代码、命令、表格照旧放在正文里——插件会自动跳过它们。',
+              '**若 `tts_state.fallback` 与这里写的不一致，以它为准**（设置可能在会话中途被改过；不一致时按它的档位行事）。',
             ].join('\n');
           }
 
@@ -3849,6 +3918,7 @@ export function apply(ctx, config = {}) {
           return [
             '## 语音播报',
             '本会话的语音播报处于开启状态。',
+            '**若 `tts_state.fallback` 与这里写的不一致，以它为准**（设置可能在会话中途被改过）。',
             '**硬规则** 每一轮给出最终答复时，必须调用一次 `speak(text)`，没有例外（除非它返回 muted）。不要用“这轮只是回答问题／只是查资料／不算结论”说服自己跳过。',
             cfg.fallback === 'authored'
               ? `**当前播报强度：${preset.label}** —— 这一轮念 ${preset.target}；${preset.hint}`
@@ -3987,6 +4057,7 @@ export function apply(ctx, config = {}) {
         offPreset?.();
         offSaveVoice?.();
         offState?.();
+        offCard?.();
         offRoute?.();
         offSection?.();
         offEvents?.();
