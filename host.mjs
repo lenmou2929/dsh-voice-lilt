@@ -2000,6 +2000,33 @@ export function apply(ctx, config = {}) {
     }
 
     /** 文本指纹：用来判断"这一段是不是已经念过了"。 */
+    /**
+     * 角色卡 / 音色表的**版本签名**。
+     * 提示词在会话内不刷新（`06` 坑 18），所以用户用面板改了角色卡之后，模型手里的那份是旧的。
+     * 这里在每轮开始 / 每次工具调用时比一次签名；变了就置 `cardDirty`，
+     * 由 `tts_state` / `speak` / `tts_card` 的返回体把「卡改过了，先读一遍」举到模型面前。
+     * 一直举到模型真的调了 `tts_card`（读过才清），避免"提示了但没人读"。
+     */
+    let cardSig = '';
+    let cardDirty = false;
+    function cardSignature() {
+      try {
+        const cards = characterCards().map((item) => `${item.name}\u0000${item.text}`).join('\u0001');
+        return hashText([String(readPersona() || ''), JSON.stringify(readCast() || []), cards].join('\u0000'));
+      } catch { return ''; }
+    }
+    function refreshCardDirty() {
+      const sig = cardSignature();
+      if (!sig) return cardDirty;
+      if (!cardSig) { cardSig = sig; return cardDirty; }
+      if (sig !== cardSig) {
+        cardSig = sig;
+        cardDirty = true;
+        note('card:changed', '角色卡/音色表变了（下一次工具返回会提示模型重读）');
+      }
+      return cardDirty;
+    }
+
     function hashText(text) {
       return createHash('sha1').update(String(text || '')).digest('hex').slice(0, 12);
     }
@@ -2416,6 +2443,7 @@ export function apply(ctx, config = {}) {
           pickModel(session, fresh);
           turnState.set(sessionId, fresh);
           note('turn/start', `session=${sessionId} turn=${event.data?.turn ?? '?'} model=${fresh.model || '-'}`);
+          refreshCardDirty();
           return;
         }
         // DSH 弹选项 / 审批时念一句提醒——**改走会话事件流**。
@@ -3137,6 +3165,9 @@ export function apply(ctx, config = {}) {
               reason: { type: 'string' },
               expanded: { type: 'boolean' },
               narrationMode: { type: 'string' },
+              fallback: { type: 'string' },
+              multiVoice: { type: 'boolean' },
+              cardDirty: { type: 'boolean' },
               strength: { type: 'string' },
               target: { type: 'number' },
               limit: { type: 'number' },
@@ -3152,7 +3183,7 @@ export function apply(ctx, config = {}) {
               v.target ? `目标≈${v.target}字` : '',
               v.limit ? `上限${v.limit}字` : '',
             ].filter(Boolean).join(' · ');
-            const suffix = tag ? ` · ${tag}` : '';
+            const suffix = `${tag ? ` · ${tag}` : ''}${v.cardDirty ? ' · 📖 角色卡已改，先调 tts_card 重读' : ''}`;
             // 扩写的结果同样是 status:'queued'，所以这一条必须判在 queued 之前，
             // 否则"按强度扩写后念"永远显示成普通的"已念（N 字）"，看卡片分不出有没有扩写。
             if (v.expanded) return [{ type: 'text', text: `🔈 按强度扩写后念（${v.chars} 字${suffix}）` }];
@@ -3280,6 +3311,11 @@ export function apply(ctx, config = {}) {
               chars: totalChars,
               segments: queuedCount,
               narrationMode: cfg.fallback === 'roleplay' ? cfg.narrationMode : undefined,
+              // 每次说话都顺手把"当前模式 / 多音色 / 卡有没有改过"带回给模型——
+              // 省掉"模型懒得调 tts_state 就一直按旧设置说话"的那条路。
+              fallback: cfg.fallback,
+              multiVoice: !!cfg.multiVoice,
+              cardDirty: refreshCardDirty() || undefined,
               strength: rplan ? cfg.strength : undefined,
               target: rplan ? Number(rplan.targetChars) || undefined : undefined,
               limit: rplan && Number(rplan.maxChars) ? Number(rplan.maxChars) : undefined,
@@ -3650,6 +3686,7 @@ export function apply(ctx, config = {}) {
               limit: { type: 'number' },
               minSegments: { type: 'number' },
               bodyFormat: { type: 'string' },
+              cardDirty: { type: 'boolean' },
               note: { type: 'string' },
               maxSegments: { type: 'number' },
               voice: { type: 'string' },
@@ -3661,6 +3698,7 @@ export function apply(ctx, config = {}) {
           render: (args, value) => {
             const v = value || {};
             const parts = [
+              v.cardDirty ? '📖 卡已改，先调 tts_card' : '',
               v.bodyFormat === 'markers' ? '正文需标记行' : (v.bodyFormat === 'free' ? '正文不限格式' : ''),
               `档位=${v.strength || '-'}`,
               v.target ? `目标≈${v.target}字` : '',
@@ -3680,9 +3718,13 @@ export function apply(ctx, config = {}) {
             fallback: cfg.fallback,
             narrationMode: cfg.narrationMode,
             bodyFormat: cfg.narrationMode === 'script' ? 'markers' : 'free',
-            note: cfg.narrationMode === 'script'
-              ? '全文念：正文每一行都要以「旁白：」或「角色名：」开头，裸写的叙述会被整行跳过'
-              : 'AI 即兴：正文不限格式',
+            cardDirty: refreshCardDirty() || undefined,
+            note: [
+              cfg.narrationMode === 'script'
+                ? '全文念：正文每一行都要以「旁白：」或「角色名：」开头，裸写的叙述会被整行跳过'
+                : 'AI 即兴：正文不限格式',
+              refreshCardDirty() ? '角色卡/音色表刚被改过：先调 `tts_card` 重读，再开演' : '',
+            ].filter(Boolean).join('；'),
             strength: cfg.strength,
             target: plan ? Number(plan.targetChars) || undefined : undefined,
             limit: plan && Number(plan.maxChars) ? Number(plan.maxChars) : undefined,
@@ -3740,6 +3782,9 @@ export function apply(ctx, config = {}) {
               seed: Number.isFinite(Number(item.seed)) ? Number(item.seed) : undefined,
             }));
             const limit = 6000;
+            // 模型已经拿到最新的一份了 → 落旗（下次再改会重新举）
+            cardSig = cardSignature();
+            cardDirty = false;
             return stripUndefined({
               scene: activeSceneId() || '',
               persona: raw.slice(0, limit),
@@ -3791,6 +3836,7 @@ export function apply(ctx, config = {}) {
               '**当前设置一律以实时工具为准**（提示词里写的是**标准与规则**，不是「现在就是某一档」）：',
               '- `tts_state`：模式 / 朗读方式（`narrationMode`）/ 多音色（`multiVoice`）/ 强度与长度 / 嗓门 / 场景；**每轮开口前调一次**。',
               '- `tts_card`：**当前**的角色卡与音色表（它们是文件，用户可能在会话中改过）；设定与说话人名字以它为准，别拿下文那份旧卡当现状。',
+              '- **任何工具返回里出现 `cardDirty: true`**（`tts_state` / `speak` / `tts_card`）→ 角色卡或音色表刚被改过：**先调 `tts_card` 重读**，再按新设定演。',
             ].join('\n'));
             if (cfg.narrationMode === 'script') {
               lines.push('**朗读方式：照本念** —— 插件按标记切分正文，**不会调用模型重写**。');
