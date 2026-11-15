@@ -98,6 +98,11 @@ const DEFAULTS = {
   fallback: 'authored',
   maxPending: 80,
   fixedText: '这轮跑完了，细节在正文。',
+  // 全文念（script）下，**没有标记的叙述行也当旁白念**。默认开——模型偶尔忘写 `旁白：` 时，
+  // 用户听到的是「旁白还在」而不是「旁白凭空消失」；状态栏/表格/代码这类有明显特征的照样跳过。
+  lenientScript: true,
+  // 角色扮演每回合末尾给 4 个选项（回复数字继续）。只影响提示词，不改变播放行为。
+  turnChoices: true,
   // 酒馆角色卡里的 {{user}} / {{char}} 换成什么名字。{{user}} 是「用户」自己，
   // 所以默认写「用户」（写「你」会和系统提示词里的「你 = 模型」打架）；卡里若有固定称呼
   // （例如「主人」），把 userName 改成它就行。charName 留空 = 自动取 cast.json 里第一个角色。
@@ -2014,12 +2019,42 @@ export function apply(ctx, config = {}) {
       const segments = [];
       const skippedSamples = [];
       let skipped = 0;
+      let lenientHits = 0;
+      // **宽松模式**。全文念只认标记行，模型一旦裸写叙述，旁白就整段消失。
+      // 这里把「明显是正文句子、又不像状态栏/表格/选项」的未标记行按旁白念——默认开（`lenientScript`）。
+      const lenient = cfg.lenientScript !== false;
+      const proseLike = (line) => {
+        if (!lenient) return false;
+        if (line.length < 6) return false;
+        if (/^[|#>`*+\-]/.test(line)) return false;              // 表格 / 标题 / 引用 / 列表
+        if (/^[0-9]+\s*[.)、]/.test(line)) return false;           // 编号行（含每回合那 4 个选项）
+        if (/^(状态|当前|进度|好感|时间|地点|轮次|HP|MP)[：:]/i.test(line)) return false;
+        return /[。！？…」]/.test(line) || line.length >= 12;       // 像句子才收
+      };
+      const add = (speakerName, tone, body) => {
+        const text = String(body || '').trim();
+        if (!text) return;
+        const last = segments[segments.length - 1];
+        if (last && last.speaker === speakerName) {
+          // 合并时把每一行的语气都留着（以前只留最后一行，前面写的语气全丢）
+          last.text = `${last.text}\n${text}`.trim();
+          if (tone && !last.tones.includes(tone)) last.tones.push(tone);
+          last.tone = last.tones.join('；');
+        } else {
+          segments.push({ speaker: speakerName, tone, tones: tone ? [tone] : [], text });
+        }
+      };
       for (const rawLine of String(text || '').split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line) continue;
         // ① 先按冒号切：冒号前的内容整体取出，**不限长度**（以前限 14 字，带语气括号的行全被丢掉）
         const match = line.match(/^([^：:\n]{1,80}?)\s*[：:]\s*([\s\S]*)$/);
         if (!match) {
+          if (proseLike(line)) {
+            lenientHits += 1;
+            add('旁白', '', line);
+            continue;
+          }
           skipped += 1;
           if (skippedSamples.length < 3) skippedSamples.push(line.slice(0, 40));
           continue;
@@ -2029,6 +2064,12 @@ export function apply(ctx, config = {}) {
         // ② 用"能对上的最长 cast 名字"当 speaker，剩下的括号内容全是这一段/这一行的语气
         const speakerName = names.find((name) => head === name || head.startsWith(name));
         if (!speakerName) {
+          // 有冒号但对不上 cast：宽松模式下整行当旁白（"雨还在下：屋檐在滴水" 这种），否则记跳过
+          if (proseLike(line)) {
+            lenientHits += 1;
+            add('旁白', '', line);
+            continue;
+          }
           skipped += 1;
           if (skippedSamples.length < 3) skippedSamples.push(line.slice(0, 40));
           continue;
@@ -2041,18 +2082,9 @@ export function apply(ctx, config = {}) {
           if (paren[1].trim()) tones.push(paren[1].trim());
           rest = rest.slice(paren[0].length);
         }
-        const tone = tones.join('；');
-        if (!body.trim()) continue;
-        const last = segments[segments.length - 1];
-        if (last && last.speaker === speakerName) {
-          // 合并时把每一行的语气都留着（以前只留最后一行，前面写的语气全丢）
-          last.text = `${last.text}\n${body}`.trim();
-          if (tone && !last.tones.includes(tone)) last.tones.push(tone);
-          last.tone = last.tones.join('；');
-        } else {
-          segments.push({ speaker: speakerName, tone, tones: tone ? [tone] : [], text: body.trim() });
-        }
+        add(speakerName, tones.join('；'), body);
       }
+      if (lenientHits) note('script:lenient', `作为旁白念的未标记行=${lenientHits}`);
       if (skipped) {
         note('script:skipped', `n=${skipped} sample=${JSON.stringify(skippedSamples)}`);
       }
@@ -3103,6 +3135,7 @@ export function apply(ctx, config = {}) {
               segments: { type: 'number' },
               reason: { type: 'string' },
               expanded: { type: 'boolean' },
+              narrationMode: { type: 'string' },
               strength: { type: 'string' },
               target: { type: 'number' },
               limit: { type: 'number' },
@@ -3245,6 +3278,7 @@ export function apply(ctx, config = {}) {
               status: 'queued',
               chars: totalChars,
               segments: queuedCount,
+              narrationMode: cfg.fallback === 'roleplay' ? cfg.narrationMode : undefined,
               strength: rplan ? cfg.strength : undefined,
               target: rplan ? Number(rplan.targetChars) || undefined : undefined,
               limit: rplan && Number(rplan.maxChars) ? Number(rplan.maxChars) : undefined,
@@ -3614,6 +3648,8 @@ export function apply(ctx, config = {}) {
               target: { type: 'number' },
               limit: { type: 'number' },
               minSegments: { type: 'number' },
+              bodyFormat: { type: 'string' },
+              note: { type: 'string' },
               maxSegments: { type: 'number' },
               voice: { type: 'string' },
               multiVoice: { type: 'boolean' },
@@ -3624,6 +3660,7 @@ export function apply(ctx, config = {}) {
           render: (args, value) => {
             const v = value || {};
             const parts = [
+              v.bodyFormat === 'markers' ? '正文需标记行' : (v.bodyFormat === 'free' ? '正文不限格式' : ''),
               `档位=${v.strength || '-'}`,
               v.target ? `目标≈${v.target}字` : '',
               v.limit ? `上限${v.limit}字` : '无字数上限',
@@ -3641,6 +3678,10 @@ export function apply(ctx, config = {}) {
             enabled: !!cfg.enabled,
             fallback: cfg.fallback,
             narrationMode: cfg.narrationMode,
+            bodyFormat: cfg.narrationMode === 'script' ? 'markers' : 'free',
+            note: cfg.narrationMode === 'script'
+              ? '全文念：正文每一行都要以「旁白：」或「角色名：」开头，裸写的叙述会被整行跳过'
+              : 'AI 即兴：正文不限格式',
             strength: cfg.strength,
             target: plan ? Number(plan.targetChars) || undefined : undefined,
             limit: plan && Number(plan.maxChars) ? Number(plan.maxChars) : undefined,
@@ -3713,6 +3754,20 @@ export function apply(ctx, config = {}) {
                 '**语音里只有对话** 调 `speak` 时只写这个角色会说的话，**不要**写旁白、动作、表情、神态、环境（"她推过笔记本"这类一律不写）——那些写进正文就行；用户要的是“这个人在跟我说话”。',
               ].join('\n'));
             }
+            // **正文格式的规则不能只写在某个朗读方式的分支里**——提示词在会话内不刷新
+            // （`06` 坑 18），用户中途把「AI 即兴」切成「全文念」时，模型看到的还是旧分支，
+            // 于是继续写没有 `旁白：` 的裸叙述，而宿主在 script 档只认标记行 → 旁白整段被跳过。
+            // 所以这一块**两种方式都写**，并且指向 `tts_state` 的实时值（标准 + 实时值分开表述）。
+            lines.push([
+              '**正文格式取决于当前朗读方式**（以 `tts_state` 返回的 `narrationMode` 为准；提示词里这段是标准，不是当前值）：',
+              '- `script`（全文念）：**正文每一行都必须以 `旁白：` 或 `角色名：` 开头**——插件只念带标记的行，裸写的叙述会被整行跳过（听感上就是「旁白凭空消失」）。',
+              '- `adapted`（AI 即兴）：正文不限格式，想怎么写就怎么写。',
+              '拿不准现在是哪一档，就先调 `tts_state`；**不确定时按 `script` 的要求写**（带标记在两种方式下都不吃亏）。',
+              cfg.turnChoices && cfg.fallback === 'roleplay'
+                ? '**每回合末尾给 4 个选项**（用户只回一个数字就继续）：正文最后单独列四行，格式固定为 `1) …` `2) …` `3) …` `4) …`，各一句话、彼此不同路；**这些选项行不要加 `旁白：` 标记**（这样全文念不会把选项念出来），即兴模式下也不要念选项；用户只回数字时，直接演那一条，不要复述选项、不要重新列旧选项。'
+                : '',
+            ].filter(Boolean).join('\n'));
+
             // 漏调 speak 的主因不是"不知道要调"，而是"写完正文忘了补"。
             // 把顺序写成硬规则，并针对"空角色卡第一轮"给固定句式——这一句最容易被兜底代劳。
             lines.push([

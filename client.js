@@ -674,7 +674,7 @@ window.__ModuleLoader__.load({
         try { el.volume = volumeRatio(state.volume); } catch { /* 已卸载 */ }
       }, [state.volume]);
 
-      /** 等 <audio> 攒够 bufferSeconds 秒音频再开播：避免流式播放中途垫底/重载。 */
+      /** 等 <audio> 攒够 N 秒音频再开播：避免流式播放中途垫底/重载。N 由 playOne 按“底数 + 时长加码”算出来。 */
       async function waitBuffered(el, seconds) {
         if (!(seconds > 0)) return;
         const enough = () => {
@@ -733,7 +733,14 @@ window.__ModuleLoader__.load({
         el.volume = volumeRatio(store.state.volume);
         audio.current = el;
         const wantBuffer = Number(state.bufferSeconds);
-        await waitBuffered(el, Number.isFinite(wantBuffer) && wantBuffer >= 0 ? wantBuffer : 2);
+        const baseSec = Number.isFinite(wantBuffer) && wantBuffer >= 0 ? wantBuffer : 2;
+        // 预缓冲 = 底数 + 按本条**预计音频时长**加码（中文 TTS ≈4.2 字/秒，取保守值）。
+        // 为什么不能定死：流式播放一旦"生成慢于播放"（GPU 被游戏抢占时 <1×），
+        // 垫底时刻 ≈ B/(1−r)。固定 2 s 在 r=0.8 时只够撑 10 s 音频，长句必然句中卡顿；
+        // 按长度加码能把长句的余量拉长，但**治本要靠把长句切成小片让生成和播放并行**。
+        const estSec = (Number(item && item.chars) || 0) / 4.2;
+        const wantSec = Math.min(Math.max(baseSec, 0.5 + estSec * 0.15), 4);
+        await waitBuffered(el, wantSec);
         if (!alive.current) return false;
         try {
           await el.play();
