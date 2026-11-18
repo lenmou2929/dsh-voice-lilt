@@ -1,5 +1,33 @@
 /**
- * dsh-voice-lilt — Host half (entry: host.mjs)
+ * dsh-voice-lilt — Host half (entry: host.mjs / 0.96.0)
+ *
+ * G0（0.96.0）：`speak` 多了一次性风格参数（`emotion / speed / vol / pitch / voiceModify`）——
+ *                只作用于这一次合成，不写盘、不要开关；底层 `resolveParams()` 早就按
+ *                `overrides > style > cfg` 支持了，缺的只是 schema 与透传。
+ * G1（0.96.0）：生成页的后端——`generated/index.json` + `GET /gen/<name>.wav` + `POST /gen`，
+ *                重名 `-1/-2`、路径限制在配置目录内、**只出 wav**（`lib/generated.mjs`）。
+ * B3（1.0.0）：**VOICE CHANGER**。`POST /voice-breeze/convert` 三个入口（生成列表里的文件名 /
+ * 工具给的本机路径 / 浏览器直接上传 wav 字节）最后都归到「宿主手里有一个 WAV Buffer」→
+ * `tts.convert()`（`lib/tts.mjs`，multipart 打 `/v1/audio/convert`，裸 PCM 用 `pcmToWav()` 包成 WAV）
+ * → 落盘/试听/入列表，`genMode:'changer'`。**只收 wav**（mp3 等以后再说）。变声期间 `/state.converting`
+ * 为真，面板据此标"忙"。抽卡/落盘的全部老规矩照旧（默认只试听，`save:true` 才写盘）。
+ *
+ * B2（0.99.0）：**采样参数 + seed 抽卡**。`temperature / top_k / top_p / repetition_penalty /
+ * max_new_tokens / split_chars` 由 `lib/tts.mjs` 的纯函数 `pickSampling()` 白名单+夹值（0/空 = 没给，
+ * 因为引擎的约定就是"0 用模型默认"），进 `cacheKey` 保证改参数不会听到旧缓存（坑 31）；
+ * `seeds:[…]`（2~4 个）一次抽 N 粒候选、**逐落盘不自动播**，面板列表里点哪条播哪条 ——
+ * 这就是 BreezeTTS 设计模式的"抽卡"玩法。抽卡必须落盘（不落盘就没有可挑的东西）。
+ *
+ * B1（0.98.0）：**生成模式显式化**。BreezeTTS 的 `/v1/audio/speech` 一个端点就能表达三种模式
+ * （design / clone / direction），`runGenerate()` 原来靠"有没有音色"隐式决定，而且空音色会被
+ * `voiceForSession()` 兜成会话音色 —— 于是**设计模式在生成页根本不可达**。
+ * 现在 `mode` 是一等参数，解析逻辑是 `lib/tts.mjs` 的纯函数 `resolveGenMode()`（可单测）；
+ * 不传 `mode` = `auto` = 0.97.0 的老行为，既有调用方不受影响。面板按 `/engine.caps.modes`
+ * 渲染切换器，**不按域名猜**。契约在 `03` §2.9.8。
+ *
+ * G2/G3（0.97.0）：面板第 5 个页签「生成」+ 工具 `tts_generate`。两者共用一条 `runGenerate()`：
+ *                合成 → （要落盘才）洗名字写盘 + 记账 → 入账目表播放；`/engine` 快照补 `caps`，
+ *                面板按 `engineCaps()` 现渲染可调项（**与引擎页同源，不按域名猜**）。
  *
  * 给模型一个 speak(text) 工具：模型自己决定要念哪一句，
  * Host 侧调用本机 BreezeTTS2（OpenAI 兼容 /v1/audio/speech）合成 WAV，
@@ -23,15 +51,18 @@
 
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { mkdir, readFile, writeFile, appendFile, stat, rename, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, appendFile, stat, rename, rm, readdir, unlink, utimes } from 'node:fs/promises';
 import { readFileSync, writeFileSync, readdirSync, createWriteStream, existsSync, statfsSync } from 'node:fs';
 import { spawn, execFile } from 'node:child_process';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { homedir } from 'node:os';
-import { cleanForSpeech, capText, createTts } from './lib/tts.mjs';
+import { cleanForSpeech, capText, createTts, ENGINE_KINDS, normalizeWav, pickCallStyle, resolveGenMode, GEN_MODES, mergeSegmentsDown, splitForChunking, voiceCatalogue, pickEngineVoice } from './lib/tts.mjs';
 import { firstSpeakableSentence, buildSummaryLine } from './lib/tts.mjs';
+// G1（0.96.0）：生成页的落盘层。命名/去重/路径限制/原子记账都在这里，
+// 宿主只负责"合成 → 交给它"，自测脚本也能直接跑同一套。
+import { saveGeneratedWav, sanitizeGenName, withinDir, readGeneratedIndex, writeGeneratedIndex, reorderEntries, planTrashPrune, trashEntryTimeMs, TRASH_DEFAULT_MAX_BYTES, GEN_EXT } from './lib/generated.mjs';
 
 /**
  * 安装引导的锁定清单（，M1）。
@@ -73,6 +104,16 @@ const DEFAULTS = {
   bufferSeconds: 2, // 流式播放前先攒够多少秒音频（用户机器上 2 s 最舒服）
   timeoutMs: 120000,
   cacheMaxMb: 512, // 64 MB 一满就淘汰，历史回播几乎存不下；512 MB ≈ 8 小时语音
+  // 1.0.9：生成的音频被**删掉**时先进 gen-trash（后悔药），这里管它最多占多大。
+  // 超了就从"最先进桶的"开始删；0 = 不设上限（只留手动清空）。拍 128 MB。
+  trashMaxBytes: TRASH_DEFAULT_MAX_BYTES,
+  // T5：长播报**切片**的片长（字）。0 = 不切（整段合成完再播）。
+  // 切 40~70 字一片：B 片合成时 A 片已经在播，引擎串行的"整段等完"就没了（`10` §12 T5）。
+  // 代价：跨片韵律会被打断（每片重新起头）。
+  //
+  // 1.2.5用户改主意：**默认关掉（0）** —— 切片牺牲跨句连贯，不该替用户默认决定；
+  // 面板那句提示写「推荐 90」（够抗卡顿、又不至于一句一顿）。想开就填 90。
+  chunkChars: 0,
   autoStartServer: true,
   startScript: '', // 首次安装由安装引导（tts_install）写入，不在代码里写死路径
   installDir: '', // 用户选定的安装目录（空 = 还没装；安装引导会写这里）
@@ -103,11 +144,18 @@ const DEFAULTS = {
   lenientScript: true,
   // 角色扮演每回合末尾给 4 个选项（回复数字继续）。只影响提示词，不改变播放行为。
   turnChoices: true,
+  // （A2）：引擎（本机 BreezeTTS2 / 任意 OpenAI 兼容云端）。
+  // `active='breeze'` 时行为与 0.76.0 完全一致；`providers` 里放用户自己加的云端记录。
+  // **key 不写在这里** 先落 `~/.dsh/voice-breeze/keys/<id>.txt`，A3 再迁进 DSH 凭据库。
+  engine: { active: 'breeze', fallbackEngine: '', providers: [] },
   // 酒馆角色卡里的 {{user}} / {{char}} 换成什么名字。{{user}} 是「用户」自己，
   // 所以默认写「用户」（写「你」会和系统提示词里的「你 = 模型」打架）；卡里若有固定称呼
   // （例如「主人」），把 userName 改成它就行。charName 留空 = 自动取 cast.json 里第一个角色。
   userName: '用户',
   charName: '',
+  // G1（0.96.0）：生成页的输出目录。空串 = 用 `<dataDir>/generated`。
+  // 用户填了别处就全部读写都在那个目录里（拒绝 `..` 与绝对路径逃逸，`lib/generated.mjs`）。
+  generated: { dir: '' },
 };
 
 function dataDir() {
@@ -253,11 +301,623 @@ export function apply(ctx, config = {}) {
     const cfg = { ...DEFAULTS, ...(config || {}) };
     const cacheDir = join(dataDir(), 'cache');
     const statePath = join(dataDir(), 'state.json');
-    const tts = createTts({ cfg, cacheDir, logger: ctx.logger });
+    /* ───────── （A2）：引擎 = 本机 BreezeTTS2 或任意 OpenAI 兼容云端 ───────── */
+
+    /**
+     * 云端 provider 的 key 落点（凭据库不可用时的兜底）。
+     *
+     * 文件名也走同一套 slug——`id` 来自用户输入，
+     * 含 `/` 或 `..` 时直接拼进路径能逃出 `keys/` 目录。旧文件名仍在读时兜一次。
+     */
+    function keyFileFor(id) {
+      return join(dataDir(), 'keys', `${credIdFor(id)}.txt`);
+    }
+
+    /** 旧版文件名（`keys/<原始 id>.txt`）。**只用于读兼容**，新写入一律走 `keyFileFor`。 */
+    function legacyKeyFileFor(id) {
+      const base = String(id ?? '').replace(/[\\/:*?"<>|]/g, '_').replace(/^\.+/, '_');
+      return join(dataDir(), 'keys', `${base || 'default'}.txt`);
+    }
+
+    /* ───────── （A3）：key 进 DSH 凭据库 + 音色清单/指北 ───────── */
+
+    /**
+     * 凭据库的键空间是**严格**的 `<scope>/<id>`：正好两段，每段
+     * `^[a-z][a-z0-9-]*$`（`@deepseek-ai/dsh-credentials` 的 `parseCredentialKey`）。
+     * scope 用本插件注册名 `voice-breeze`；id 由 provider id 规范化成 `engine-<slug>`。
+     *
+     *  一开始写成 `voice-breeze/engine/<id>`（三段），`modifyRecord()` 不校验键名，
+     * 落盘成功；下次启动 `parseRecords()` 读到这个键直接抛 TypeError，整个
+     * `credentials-local` 服务激活失败，所有依赖它的插件全部卡住，DSH 起不来。
+     * 所以这里**不能**把用户可编辑的 provider id 原样拼进键：必须 slug 化，并在
+     * 拼接后再验一遍；不合法就返回 null，退回 `keys/<id>.txt`，绝不写坏键。
+     */
+    const CRED_SCOPE = 'voice-breeze';
+    /** 与 dsh-credentials 的 KEY_SEGMENT_PATTERN 同规则：两段，各段小写字母开头。 */
+    const CRED_KEY_PATTERN = /^[a-z][a-z0-9-]*\/[a-z][a-z0-9-]*$/;
+
+    /** provider id → 合法且稳定的 id 段。改过名的 id 带 6 位哈希，避免 a.b / a-b 撞键。 */
+    function credIdFor(id) {
+      const raw = String(id ?? '').trim().toLowerCase();
+      let slug = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      if (!slug) slug = 'default';
+      if (!/^[a-z]/.test(slug)) slug = `p-${slug}`;
+      if (slug !== raw) slug = `${slug}-${createHash('sha1').update(raw).digest('hex').slice(0, 6)}`;
+      return `engine-${slug}`;
+    }
+
+    /** 合法键；不合法返回 null（调用方必须处理 null）。 */    function credKeyFor(id) {
+      const key = `${CRED_SCOPE}/${credIdFor(id)}`;
+      if (!CRED_KEY_PATTERN.test(key)) {
+        note('engine:key-invalid', `${id} → ${key} 不是 <scope>/<id>，改用 keys/${id}.txt`);
+        return null;
+      }
+      return key;
+    }
+
+    /**
+     * 凭据键自检。事故 `logs/132` 的教训 —— 凭据库**写入时不校验键名**，
+     * 一个坏键要等到下次启动才炸，而且会把整个 DSH 起不来。
+     * 所以每次启动都跑一遍：拿一批最脏的 provider id 走 `credKeyFor()`，全部必须合法。
+     */
+    function credentialKeySelfTest() {
+      const probes = ['sf', 'SF', 'my.engine', 'a_b', '../evil', '', '1abc', '  sf  '];
+      const bad = [];
+      for (const id of probes) {
+        const key = credKeyFor(id);
+        if (!key || !CRED_KEY_PATTERN.test(key)) bad.push(`${JSON.stringify(id)}→${key}`);
+      }
+      note('engine:cred-selftest', bad.length ? `FAIL ${bad.join(' ')}` : `ok ${probes.length} 个 id 全部合法`);
+    }
+
+    /** `credentials` 是**可选**服务：拿不到就返回 null，绝不让一次 get 把整条播报链拖垮。 */
+    function credentialsService() {
+      try {
+        return (typeof ctx.get === 'function' ? ctx.get('credentials') : null) || null;
+      } catch {
+        return null;
+      }
+    }
+
+    /** 读 key：凭据库优先，其次旧的 `keys/<id>.txt`（老安装迁移用）。 */
+    async function readEngineKey(id) {
+      const creds = credentialsService();
+      const credKey = credKeyFor(id);
+      if (creds && credKey) {
+        try {
+          const record = await creds.readRecord(credKey);
+          if (record && record.kind === 'api-key' && typeof record.key === 'string' && record.key.trim()) {
+            return record.key.trim();
+          }
+        } catch (error) {
+          note('engine:key-read-fail', `${id} ${(error && error.message) || error}`);
+        }
+      }
+      // 文件兜底：新文件名优先，读不到再试旧版（`<原始 id>.txt`）——老安装不用手动搬文件
+      for (const file of [keyFileFor(id), legacyKeyFileFor(id)]) {
+        try {
+          const value = String(await readFile(file, 'utf8')).trim();
+          if (value) return value;
+        } catch { /* 换下一个 */ }
+      }
+      return '';
+    }
+
+    /**
+     * 写 key：进凭据库，**不写 `state.json`**；
+     * 凭据库不可用才落到 `keys/<id>.txt`，并在日志里留痕。写成功后删掉旧的明文文件。
+     */
+    async function writeEngineKey(id, value) {
+      const key = String(value || '').trim();
+      if (!key) return false;
+      const creds = credentialsService();
+      const credKey = credKeyFor(id);
+      if (creds && credKey) {
+        try {
+          await creds.modifyRecord(credKey, async () => ({ kind: 'api-key', key }));
+          await rm(keyFileFor(id), { force: true }).catch(() => {});
+          return true;
+        } catch (error) {
+          note('engine:key-write-fail', `${id} ${(error && error.message) || error}`);
+        }
+      }
+      try {
+        await mkdir(join(dataDir(), 'keys'), { recursive: true });
+        await writeFile(keyFileFor(id), key, 'utf8');
+        note('engine:key-file', `${id} 凭据库不可用，暂存 keys/${id}.txt`);
+        return true;
+      } catch (error) {
+        note('engine:key-write-fail', `${id} ${(error && error.message) || error}`);
+        return false;
+      }
+    }
+
+    async function deleteEngineKey(id) {
+      const creds = credentialsService();
+      const credKey = credKeyFor(id);
+      if (creds && credKey) await creds.deleteRecord(credKey).catch(() => {});
+      await rm(keyFileFor(id), { force: true }).catch(() => {});
+    }
+
+    async function engineKeyPresent(id) {
+      if (await readEngineKey(id)) return true;
+      return existsSync(keyFileFor(id));
+    }
+
+    /**
+     * 厂商识别 + 音色指北（`15` §4.9）。认不出就走通用兜底；
+     * 文案必须回答三件事：**现在用谁 / 为什么藏了音色 / 想换音色怎么办**。
+     */
+    const VENDOR_NOTES = {
+      openai: {
+        vendor: 'openai',
+        presets: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'onyx', 'nova', 'sage', 'shimmer', 'verse'],
+        how: 'OpenAI 官方没有「列出音色」的接口，可用名就是上面这一串；在音色框里改成其中一个，点试听确认即可。',
+      },
+      siliconflow: {
+        vendor: 'siliconflow',
+        // 官方文档 §2.1 的 8 个系统预置音色（男 alex/benjamin/charles/david，女 anna/bella/claire/diana）。
+        // 它家的 `voice` 要带模型前缀，形如 `FunAudioLLM/CosyVoice2-0.5B:alex`，前缀在 voiceProfile() 里拼。
+        presets: ['alex', 'benjamin', 'charles', 'david', 'anna', 'bella', 'claire', 'diana'],
+        voicePrefix: true,
+        how: '硅基流动的 voice 要写成「模型名:音色名」，例如 FunAudioLLM/CosyVoice2-0.5B:alex；官方有 8 个系统音色，也能用 /v1/uploads/audio/voice 上传参考音频建自己的音色，拿到的 uri 直接当 voice 填。',
+      },
+      groq: { vendor: 'groq', presets: [], how: 'Groq 的音色随所选 TTS 模型而定，换 model 或 voice 后点试听确认。' },
+      minimax: {
+        vendor: 'minimax',
+        // 官方文档给的系统音色示例（`voice_setting.voice_id`）；完整清单走 Get Voice 接口或控制台。
+        presets: [
+          'Chinese (Mandarin)_Lyrical_Voice',
+          'Chinese (Mandarin)_HK_Flight_Attendant',
+          'English_Graceful_Lady',
+          'English_radiant_girl',
+        ],
+        how: 'MiniMax 的音色叫 voice_id，必须填（不填直接 400）。先用上面这几个系统音色试，完整清单在控制台或 Get Voice 接口里；自己克隆的音色也会给一个 voice_id，填进来即可。',
+      },
+      elevenlabs: { vendor: 'elevenlabs', presets: [], how: 'ElevenLabs 有 `GET /voices`，专用适配会直接列出来（A4）；眼下先把 voice_id 手填进来。' },
+      volc: { vendor: 'volc', presets: [], how: '火山/豆包的音色是 `voice_type` 且要 appid/cluster，不是纯 OpenAI 兼容端点，需专用适配（A4）。' },
+      generic: {
+        vendor: 'generic',
+        presets: [],
+        how: '去该服务商的文档找 `voice` 参数的可选值填进来，点试听验证（能出声就是对的）；若它支持上传参考音频做音色克隆，先在那边建好音色再填名字/ID；有些引擎自带默认音色，留空也能出声。',
+      },
+    };
+
+    /**
+     * （A4b）：**识别厂商专用的 kind**。
+     *
+     * 起因：面板表单原先写死 `kind:'openai-compat'`，于是 MiniMax 被存成兼容端点，
+     * 请求打到 `/v1/audio/speech` 拿 404。
+     * 现在两层兜：客户端按域名猜 + 宿主在这里再纠正一次（老数据、手改 state.json 都能自愈）。
+     */
+    function coerceKind(kind, baseUrl) {
+      const wanted = ENGINE_KINDS.includes(kind) && kind !== 'breeze' ? kind : '';
+      if (wanted === 'minimax') return 'minimax';
+      let host = '';
+      try {
+        host = new URL(String(baseUrl || '')).hostname.toLowerCase();
+      } catch { /* 地址不合法就只看 kind */ }
+      if (host.includes('minimax') || host.includes('minimaxi')) return 'minimax';
+      return wanted || 'openai-compat';
+    }
+
+    /**
+     * P2：把面板/不信任来源递来的 `style` 洗成能用的一小块。
+     *
+     * 只留白名单字段、数值夹到合法区间、空字段直接不写 —— 因为这一段会被原样交给
+     * `lib/tts.mjs` 塞进请求体，脏值最容易的表现是"整条合成 400"或"音色被悄悄改掉"。
+     * **这里不做"这家支不支持"的判断** 那是 `engineCaps()` / `sanitizeForEngine()` 的活。
+     */
+    function coerceStyle(raw) {
+      // G0（0.96.0）：白名单/夹值这件事收进 `lib/tts.mjs` 的 `pickCallStyle()` ——
+      // 面板上的全局风格与 `speak` 的一次性参数必须用同一套规则，否则"同样是 speed"两处会夹到不同的区间。
+      const src = raw && typeof raw === 'object' ? raw : {};
+      const out = pickCallStyle(src);
+      // （P4a）：多音色混音。官方限制「最多 4 个、权重 1~100」——这里就按这个洗。
+      // 少于 2 条不写（一条不叫混音，留空让 voice_id 走正常路径）。
+      if (Array.isArray(src.timbreWeights)) {
+        const mixes = src.timbreWeights
+          .map((one) => ({
+            voice_id: String(one && one.voice_id ? one.voice_id : '').trim(),
+            weight: Math.min(100, Math.max(1, Math.round(Number(one && one.weight) || 0))),
+          }))
+          .filter((one) => one.voice_id && one.weight > 0)
+          .slice(0, 4);
+        if (mixes.length >= 2) out.timbreWeights = mixes;
+      }
+      // P4a：两个可选项也走白名单（不洗的话面板传过来会被静默丢掉）
+      if (src.outputMode === 'url') out.outputMode = 'url';
+      if (src.subtitles === true) out.subtitles = true;
+      return out;
+    }
+
+    function vendorOf(baseUrl) {
+      let host = '';
+      try {
+        host = new URL(String(baseUrl || '')).hostname.toLowerCase();
+      } catch {
+        return VENDOR_NOTES.generic;
+      }
+      if (host === 'api.openai.com') return VENDOR_NOTES.openai;
+      if (host.includes('siliconflow')) return VENDOR_NOTES.siliconflow;
+      if (host.includes('groq')) return VENDOR_NOTES.groq;
+      if (host.includes('minimax') || host.includes('minimaxi')) return VENDOR_NOTES.minimax;
+      if (host.includes('elevenlabs')) return VENDOR_NOTES.elevenlabs;
+      if (host.includes('bytedance') || host.includes('volces')) return VENDOR_NOTES.volc;
+      return VENDOR_NOTES.generic;
+    }
+
+    /** 一个 provider 的音色现状：能不能列清单 / 清单是什么 / 该怎么跟用户说。 */
+    function voiceProfile(provider) {
+      const info = vendorOf(provider.baseUrl);
+      const model = String(provider.model || 'tts-1').trim();
+      // 有的家（硅基流动）voice 必须带模型前缀，这里统一拼好，用户看到的就是能直接用的名字
+      const presets = (Array.isArray(info.presets) ? info.presets : [])
+        .map((name) => (info.voicePrefix ? `${model}:${name}` : name));
+      const known = Array.isArray(provider.knownVoices) ? provider.knownVoices : [];
+      // 1.2.1：把"拉取清单"存下的整份目录也并进来 —— 生成页的音色下拉读的就是 `items`。
+      const catalogue = Array.isArray(provider.voiceCatalogue) ? provider.voiceCatalogue : [];
+      const items = voiceCatalogue(known, catalogue, presets);
+      const mode = items.length ? 'list' : 'manual';
+      const label = provider.label || provider.id || '云端引擎';
+      return {
+        voiceMode: mode,
+        vendor: info.vendor,
+        presetVoices: presets,
+        knownVoices: known,
+        items,
+        guidance: mode === 'list'
+          ? ''
+          : `当前用的是「${label}」（${info.vendor}）。这个端点没有提供音色清单，所以音色选项被隐藏了。想换音色：${info.how}`,
+      };
+    }
+
+    /** 当前引擎的音色现状（`breeze` 的音色来自它自己的声音库，永远算"能列"）。 */
+    function activeVoiceProfile() {
+      const rec = tts ? tts.engine : activeRecord();
+      if (rec.kind === 'breeze') return { voiceMode: 'list', vendor: 'breeze', presetVoices: [], knownVoices: [], items: [], guidance: '' };
+      const found = engineConfig().providers.find((one) => one && String(one.id) === rec.id) || {};
+      return voiceProfile({ ...found, id: rec.id, baseUrl: rec.baseUrl, label: rec.label });
+    }
+
+    /**
+     * 1.2.1：**把"拉取清单"的结果记进 provider**。
+     *
+     * 以前「拉取清单」只 `setVoiceList()` 到引擎页的局部 state —— 于是生成页永远看不到（它读 `/engine.items`）。
+     * 现在整份目录存 `voiceCatalogue`（最多 400 条：MiniMax 官方库 300+），
+     * 与 `knownVoices`（用过的那 24 个）分开存：后者会被 `rememberVoice()` 的"只留最近 24"反复截断，
+     * 混在一起会让刚拉到的目录被下一句合成洗掉。
+     */
+    async function rememberVoiceCatalogue(engineId, ids) {
+      const list = (Array.isArray(ids) ? ids : [])
+        .map((one) => String(one || '').trim())
+        .filter(Boolean);
+      if (!list.length) return 0;
+      const conf = engineConfig();
+      const target = conf.providers.find((one) => one && String(one.id) === engineId);
+      if (!target) return 0;
+      const uniq = [...new Set(list)].slice(0, 400);
+      const before = Array.isArray(target.voiceCatalogue) ? target.voiceCatalogue.length : 0;
+      target.voiceCatalogue = uniq;
+      cfg.engine = { ...conf, providers: conf.providers };
+      await persist();
+      note('engine:voice-catalogue', `id=${engineId} n=${uniq.length} was=${before}`);
+      return uniq.length;
+    }
+
+    /** A3：成功合成过的音色名记进 provider 的 `knownVoices`（按 provider 分桶、去重、只留最近 24 个）。 */
+    function rememberVoice(engineId, voice) {
+      const name = String(voice || '').trim();
+      if (!name) return;
+      const conf = engineConfig();
+      const target = conf.providers.find((one) => one && String(one.id) === engineId);
+      if (!target) return;
+      const known = Array.isArray(target.knownVoices) ? target.knownVoices : [];
+      if (known.includes(name)) return;
+      target.knownVoices = [...known, name].slice(-24);
+      cfg.engine = { ...conf, providers: conf.providers };
+      void persist();
+      note('engine:voice-known', `${engineId} +${name}`);
+    }
+
+    /** 本机引擎的天然记录：字段全来自 cfg —— 等价于 0.76.0 的行为。 */
+    function breezeRecord() {
+      return {
+        id: 'breeze',
+        kind: 'breeze',
+        label: '本机 BreezeTTS2',
+        baseUrl: cfg.baseUrl,
+        model: 'tts-1',
+        audioFormat: 'wav',
+        timeoutMs: Number(cfg.timeoutMs) || 120000,
+      };
+    }
+
+    function engineConfig() {
+      const raw = cfg.engine && typeof cfg.engine === 'object' ? cfg.engine : {};
+      return {
+        active: String(raw.active || 'breeze'),
+        fallbackEngine: String(raw.fallbackEngine || ''),
+        providers: Array.isArray(raw.providers) ? raw.providers : [],
+      };
+    }
+
+    /** 把一条 provider 记录变成 `createTts` 认得的形状（补 key 解析器）。 */
+    function recordFor(provider) {
+      const id = String(provider.id);
+      return {
+        ...provider,
+        id,
+        kind: ENGINE_KINDS.includes(provider.kind) && provider.kind !== 'breeze' ? provider.kind : 'openai-compat',
+        timeoutMs: Number(provider.timeoutMs) || Number(cfg.timeoutMs) || 120000,
+        // key 每次用时现读（凭据库优先）—— 换了 key 不用重启、也不用重建适配器。
+        apiKeyResolver: () => readEngineKey(id),
+        apiKeyFile: '',
+      };
+    }
+
+    /** 当前生效的记录。找不到就回本机，并留一条日志（不静默换引擎）。 */
+    function activeRecord() {
+      const conf = engineConfig();
+      if (conf.active === 'breeze') return breezeRecord();
+      const found = conf.providers.find((one) => one && String(one.id) === conf.active);
+      if (!found) {
+        note('engine:missing', `${conf.active} 不在 providers 里，先按本机引擎播`);
+        return breezeRecord();
+      }
+      return recordFor(found);
+    }
+
+    function recordById(id) {
+      if (id === 'breeze') return breezeRecord();
+      const found = engineConfig().providers.find((one) => one && String(one.id) === id);
+      return found ? recordFor(found) : null;
+    }
+
+    /**
+     * 重建适配器。切引擎 = 换一条 provider 记录 + `createTts` 重建一次，
+     * 播报链、账目、路由、客户端全都不动。
+     */
+    function rebuildTts() {
+      const record = activeRecord();
+      tts = createTts({ cfg, cacheDir, logger: ctx.logger, provider: record });
+      // 这一行是"宿主真的加载了引擎记录"的硬证据（坑 1：只重启窗口/会话不一定重启宿主）。
+      note('engine:init', `id=${tts.engine.id} kind=${tts.engine.kind} base=${tts.engine.baseUrl}`);
+      return tts;
+    }
+
+    let localTts = null;
+    /**
+     * 本机引擎的固定实例。安装引导、设计音色（`tts_save_voice`）、出厂预设自举、`tts_probe`
+     * 这些**BreezeTTS 专属**的活用它 —— 它们不受"当前引擎"影响（`15` §8 第 4 条）。
+     */
+    function breezeTts() {
+      if (!localTts) localTts = createTts({ cfg, cacheDir, logger: ctx.logger, provider: breezeRecord() });
+      return localTts;
+    }
+
+    /**
+     * A2：把「要用的嗓子」换成**当前引擎认得**的名字。
+     *
+     * 本机音色名（`你的音色id` 之类）在云端根本不存在 —— 原样发过去轻则 400，重则云端
+     * 静默换成别的嗓子念（那比报错更难查）。规则（`15` §5 第 4 条）：
+     * 当前引擎不是 breeze 时 → 用它的 `defaultVoice`；**没配就整个 voice 字段不发**
+     * （先出声优先：宁可让引擎用它自己的默认嗓子，也不能因为音色对不上就不出声）。
+     */
+    /**
+     * 1.2.3：**云端音色映射不能"一律换成默认"**。
+     *
+     * 以前这里是：`不是 defaultVoice 就返回 defaultVoice` —— 那是为**播报**写的（会话里记的是本机音色 id，
+     * 云端没有那把嗓子，不换就 404）。但它同样作用在**生成页**上：用户从那家的清单里挑了一把男声，
+     * 照样被换回默认女声 —— 表现就是"音色选得中，但不参与生成"。
+     * 现在判据只有一条：**这个 id 是不是当前引擎自己的**（在它的清单里）。是就放行，不是才回退。
+     * 判断本身抽到 `lib/tts.mjs` 的 `pickEngineVoice()`（纯函数，有自测）。
+     */
+    const voiceMapSeen = new Set();
+    function voiceForEngine(voice) {
+      const rec = tts.engine;
+      const known = rec.kind === 'breeze' ? [] : (activeVoiceProfile().items || []);
+      const sent = pickEngineVoice({
+        kind: rec.kind,
+        wanted: voice,
+        defaultVoice: rec.defaultVoice,
+        known,
+      });
+      // 只在**真的换掉了**的时候记一行（同一对只记一次）：这正是"我选的男声去哪了"的答案
+      const wanted = String(voice || '').trim();
+      if (wanted && sent !== wanted) {
+        const key = `${rec.kind}:${wanted}->${sent}`;
+        if (!voiceMapSeen.has(key)) {
+          voiceMapSeen.add(key);
+          note('voice:mapped', `kind=${rec.kind} ${wanted} → ${sent || '(不发)'}（这个 id 不在 ${rec.id} 的清单里）`);
+        }
+      }
+      return sent;
+    }
+
+    /**
+     * P1：把「当前引擎认识哪些记号」翻成人话交给模型。
+     *
+     * **为什么不是"切引擎就换提示词"** 系统提示词在会话内不刷新（`06` 坑 18，三次实测），
+     * 换一套写死的能力表，切引擎后模型拿到的还是旧的那套 —— 它会继续对 breeze 写 `(laughs)`，
+     * 而 breeze 会把"括号 laughs 括号"照字念出来。所以：
+     *   提示词只写一句恒定的话「能写哪些以 `engineHints` 为准」，
+     *   具体能力由这里读 `tts.caps` 现算（`lib/tts.mjs` 的 `engineCaps()` 是唯一真相）。
+     */
+    function engineHints() {
+      const cap = (tts && tts.caps) || {};
+      const hints = [];
+      if (cap.pauseTag) {
+        hints.push(`可以写 <#0.5#> 做停顿（${cap.pauseTag.min}~${cap.pauseTag.max} 秒，两个停顿之间必须有可念的字，不能连着写）`);
+      }
+      if (Array.isArray(cap.interjections) && cap.interjections.length) {
+        hints.push(`可以写括号语气词，只能用这几个：${cap.interjections.join(' / ')}`);
+      }
+      if (Array.isArray(cap.emotions) && cap.emotions.length) {
+        hints.push(`可以指定情绪：${cap.emotions.join(' / ')}`);
+      }
+      // G0（0.96.0）：这三项是"参数级"能力（走 `voice_setting`），与记号不同 ——
+      // 只在这家认识时出现，免得模型对 breeze 传 speed 然后以为生效了。
+      if (cap.voiceSetting) {
+        hints.push('可以一次性改 `speed`（0.5~2，1=原速）/ `vol`（0.01~10）/ `pitch`（-12~12）：用 `speak` 的同名参数给，只影响这一次');
+      }
+      if (cap.voiceModify) {
+        hints.push('可以一次性给 `voiceModify`（音色微调 `{pitch,intensity,timbre,soundEffects}`，例如 `lofi_telephone`）');
+      }
+      if (!hints.length) {
+        hints.push('当前引擎不认识任何记号：不要写 <#x#> 停顿，不要写括号语气词，不要指定情绪（照字念出来会变成噪音）');
+      }
+      return hints;
+    }
+
+    /**
+     * P3：当前引擎的**写法手册**（官方文档里"怎么喂文本它才念得好"的那部分）。
+     *
+     * 手册本体在 `lib/tts.mjs` 的 `playbookFor()`，按 kind + caps 生成；这里只是转发。
+     * **为什么手册不进系统提示词** 理由与能力表完全相同（`06` 坑 27）——提示词会话内不刷新，
+     * 切引擎后写死的那套会变成谎话。走 `tts_state` 返回，切一次引擎就换一份。
+     */
+    function enginePlaybookLines() {
+      try {
+        const lines = tts && tts.playbook;
+        return Array.isArray(lines) && lines.length
+          ? lines
+          : ['按普通口语写：短句、标点断句、不写引擎记号'];
+      } catch {
+        return ['按普通口语写：短句、标点断句、不写引擎记号'];
+      }
+    }
+
+    /**
+     * P1：能力摘要，一行中文，给卡片看 —— 让「这台引擎支持什么」对**用户**也可见。
+     * 与 `engineHints()` 同源（都读 `tts.caps`）：一个给模型，一个给人。
+     */
+    function engineSupportLine() {
+      const cap = (tts && tts.caps) || {};
+      const bits = [];
+      if (cap.pauseTag) bits.push('停顿');
+      if (Array.isArray(cap.interjections) && cap.interjections.length) bits.push(`语气词${cap.interjections.length}`);
+      if (Array.isArray(cap.emotions) && cap.emotions.length) bits.push(`情绪${cap.emotions.length}档`);
+      if (cap.voiceModify) bits.push('调音台');
+      if (cap.voiceSetting) bits.push('语速音量音调');
+      if (cap.timbreMix) bits.push('混音');
+      if (cap.wordTimestamps) bits.push('词级字幕');
+      return bits.length ? bits.join('·') : '无记号';
+    }
+
+    /**
+     * 当前引擎合成失败 → 按 `engine.fallbackEngine` 回退一次（默认空 = 不回退）。
+     * 回退也失败就把**原来的**错误抛出去，交给现有兜底链（`10` §6，永不静音）。
+     */
+    async function withEngineFallback(run) {
+      const primary = tts;
+      try {
+        return await run(primary);
+      } catch (error) {
+        const conf = engineConfig();
+        if (!conf.fallbackEngine || primary.engine.id === conf.fallbackEngine) throw error;
+        const record = recordById(conf.fallbackEngine);
+        if (!record) throw error;
+        const backup = createTts({ cfg, cacheDir, logger: ctx.logger, provider: record });
+        if (!(await backup.healthy().catch(() => false))) throw error;
+        note('engine:fallback', `${primary.engine.id}→${backup.engine.id} ${(error && error.message) || error}`);
+        const result = await run(backup);
+        if (result && typeof result === 'object') result.engineFallback = true;
+        return result;
+      }
+    }
+
+    /** 面板/路由看的引擎快照（**不含 key**，只报 keyPresent；A3 起带音色现状与指北）。 */
+    async function engineSnapshot() {
+      const conf = engineConfig();
+      const live = tts ? tts.engine : activeRecord();
+      const providers = [];
+      for (const one of conf.providers) {
+        const profile = voiceProfile(one);
+        providers.push({
+          id: one.id,
+          kind: one.kind,
+          label: one.label,
+          baseUrl: one.baseUrl,
+          model: one.model,
+          defaultVoice: one.defaultVoice || '',
+          supportsInstructions: Boolean(one.supportsInstructions),
+          // P2：这一家的风格（情绪 / 语速 / 音量 / 音调 / 调音台），面板据此回填
+          style: one.style && typeof one.style === 'object' ? one.style : {},
+          keyPresent: await engineKeyPresent(one.id),
+          voiceMode: profile.voiceMode,
+          vendor: profile.vendor,
+          items: profile.items,
+          guidance: profile.guidance,
+        });
+      }
+      const activeProfile = tts ? activeVoiceProfile() : { voiceMode: 'list', vendor: 'breeze', items: [], guidance: '' };
+      return {
+        active: conf.active,
+        fallbackEngine: conf.fallbackEngine,
+        effective: {
+          id: live.id,
+          kind: live.kind,
+          label: live.label,
+          baseUrl: live.baseUrl,
+          model: live.model,
+        },
+        kinds: ENGINE_KINDS,
+        // （P4a）：当前引擎的写法手册 —— 面板「当前引擎」卡里摊开给用户看，
+        // 与模型拿到的 `tts_state.enginePlaybook` 是同一份（同一个 `tts.playbook`）。
+        playbook: enginePlaybookLines(),
+        /*
+         * G2：**把能力表交给面板**。生成页要"按这家认识什么现渲染控件"，
+         * 而能力表的唯一真相在 `lib/tts.mjs` 的 `engineCaps()`（宿主与模型读的是同一份）。
+         * 面板**不许按域名猜**（引擎页当初就是这么猜 minimax 的，域名一改就瞎）；
+         * 这里把可序列化的那几项原样给出去，面板只管照着画。
+         */
+        caps: (() => {
+          const cap = (tts && tts.caps) || {};
+          return {
+            kind: String(cap.kind || 'breeze'),
+            pauseTag: cap.pauseTag ? { min: Number(cap.pauseTag.min), max: Number(cap.pauseTag.max) } : null,
+            interjections: Array.isArray(cap.interjections) ? cap.interjections.slice(0, 40) : [],
+            emotions: Array.isArray(cap.emotions) ? cap.emotions.slice(0, 20) : [],
+            voiceModify: Boolean(cap.voiceModify),
+            voiceSetting: Boolean(cap.voiceSetting),
+            timbreMix: Boolean(cap.timbreMix),
+            wordTimestamps: Boolean(cap.wordTimestamps),
+            urlOutput: Boolean(cap.urlOutput),
+            maxChars: Number(cap.maxChars) || 2000,
+            // B1（0.98.0）：这家能打哪几种生成模式 + 有没有独立的变声入口。
+            // 面板的「生成」页按它渲染模式切换器 —— 能力表的真相只在 `engineCaps()` 一份。
+            /*
+             * `changer` 不在 `GEN_MODES` 里（那是 `runGenerate` 的 mode 集合，变声走另一条链路），
+             * 所以过滤时**要单独放它一个** —— 否则能力表把"变声"这档自己滤掉了，
+             * 面板永远看不到第四个模式（B3 第一次跑自测就撞上）。
+             */
+            modes: Array.isArray(cap.modes)
+              ? cap.modes.filter((one) => one === 'changer' || GEN_MODES.includes(one)).slice(0, 6)
+              : ['clone'],
+            convert: Boolean(cap.convert),
+            // B2：这家认哪些采样参数（面板「高级」区照它渲染，键名与工具参数一致）
+            sampling: Array.isArray(cap.sampling) ? cap.sampling.slice(0, 12) : [],
+          };
+        })(),
+        voiceMode: activeProfile.voiceMode,
+        items: activeProfile.items,
+        guidance: activeProfile.guidance,
+        keyBackend: credentialsService() ? 'credentials' : 'file',
+        providers,
+      };
+    }
+
+    let tts = null;
+    rebuildTts();
+    credentialKeySelfTest();
 
     /** @type {Map<string, {id:string,seq:number,file:string,text:string,chars:number,ms:number,session:string}>} */
     const ledger = new Map();
     let seq = 0;
+    // T5：切片分组号（同一个 `pieceGroup` = 同一段的续片）。放闭包级，跨调用也不会撞号。
+    let pieceGroupSeq = 0;
+    const nextPieceGroup = () => { pieceGroupSeq += 1; return `${Date.now().toString(36)}-${pieceGroupSeq}`; };
     /**
      * 助手消息 id → 回合号。消息动作行上的 🔊 按钮（客户端）只拿得到 messageId，
      * 要重播就得先换算成 turn。内存表，滚动保留最近 500 条；重启后清空（跨重启历史见待办 F0b）。
@@ -293,6 +953,8 @@ export function apply(ctx, config = {}) {
             multiVoice: Boolean(cfg.multiVoice),
             narrationMode: cfg.narrationMode,
             segmentGapMs: Number(cfg.segmentGapMs) >= 0 ? Number(cfg.segmentGapMs) : 500,
+            // T5：长播报切片片长（0 = 不切）。面板「选项」页那一格读它。
+            chunkChars: Number(cfg.chunkChars) || 0,
             bufferSeconds: Number(cfg.bufferSeconds) >= 0 ? Number(cfg.bufferSeconds) : 2,
             toneInstructions: cfg.toneInstructions,
             installDir: cfg.installDir || '',
@@ -307,6 +969,11 @@ export function apply(ctx, config = {}) {
               y: Number.isFinite(cfg.panel && cfg.panel.y) ? Number(cfg.panel.y) : 0,
             },
             startScript: cfg.startScript || '',
+            engine: {
+              active: String((cfg.engine && cfg.engine.active) || 'breeze'),
+              fallbackEngine: String((cfg.engine && cfg.engine.fallbackEngine) || ''),
+              providers: Array.isArray(cfg.engine && cfg.engine.providers) ? cfg.engine.providers : [],
+            },
             sessions: cfg.sessions,
           }, null, 2),
           'utf8',
@@ -357,6 +1024,35 @@ export function apply(ctx, config = {}) {
           cfg.sessions = {};
           for (const [key, value] of Object.entries(parsed.sessions)) {
             if (value && typeof value.voice === 'string') cfg.sessions[key] = { voice: value.voice };
+          }
+        }
+        // （A2）：引擎配置。坏的记录直接丢掉（宁可回本机出声，也不能因为一条脏数据整条链不响）。
+        if (parsed?.engine && typeof parsed.engine === 'object') {
+          const providers = Array.isArray(parsed.engine.providers)
+            ? parsed.engine.providers
+              .filter((one) => one && typeof one.id === 'string' && one.id.trim() && one.id !== 'breeze')
+              .map((one) => ({
+                id: String(one.id).trim(),
+                kind: coerceKind(one.kind, one.baseUrl),
+                label: String(one.label || one.id).trim(),
+                baseUrl: String(one.baseUrl || '').trim(),
+                model: String(one.model || 'tts-1').trim(),
+                defaultVoice: String(one.defaultVoice || '').trim(),
+                audioFormat: 'wav',
+                supportsInstructions: Boolean(one.supportsInstructions),
+                // A3：成功用过的音色（去重、最多 24 个）
+                knownVoices: Array.isArray(one.knownVoices)
+                  ? one.knownVoices.filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim()).slice(-24)
+                  : [],
+              }))
+            : [];
+          cfg.engine = {
+            active: typeof parsed.engine.active === 'string' && parsed.engine.active.trim() ? parsed.engine.active.trim() : 'breeze',
+            fallbackEngine: typeof parsed.engine.fallbackEngine === 'string' ? parsed.engine.fallbackEngine.trim() : '',
+            providers,
+          };
+          if (cfg.engine.active !== 'breeze' && !providers.some((one) => one.id === cfg.engine.active)) {
+            cfg.engine.active = 'breeze';
           }
         }
       } catch { /* 首次运行没有状态文件 */ }
@@ -508,12 +1204,32 @@ export function apply(ctx, config = {}) {
 
     function remember(entry) {
       ledger.set(entry.id, entry);
-      if (ledger.size > cfg.maxPending) {
-        // 只淘汰已经合成完的，正在流的不能被踢（客户端可能正在读）
-        const oldest = [...ledger.values()]
-          .filter((item) => item.done)
-          .sort((a, b) => a.seq - b.seq)[0];
-        if (oldest) ledger.delete(oldest.id);
+      /*
+       * 1.2.4：**淘汰要分先后 —— 播报先留住**。
+       *
+       * 以前一律"踢最旧的那条"。而面板生成的音频（`kind:'gen'`）一次能进好几条，
+       * 把播报条目挤出去之后，点「重播最新一轮」拿到的 id 就已经 404（表现为红字报错）。
+       * 现在：先淘汰 gen，再淘汰 pause，最后才动 speech；speech 另有 600 条的硬上限兜底。
+       */
+      const pickVictim = () => {
+        const done = [...ledger.values()].filter((item) => item.done);
+        if (!done.length) return null;
+        const order = { gen: 0, pause: 1, speech: 2 };
+        const rank = (item) => (order[item.kind] === undefined ? 1 : order[item.kind]);
+        return done.sort((a, b) => (rank(a) - rank(b)) || (a.seq - b.seq))[0];
+      };
+      let guard = 0;
+      while (ledger.size > cfg.maxPending && guard < 200) {
+        const victim = pickVictim();
+        if (!victim) break;
+        ledger.delete(victim.id);
+        guard += 1;
+      }
+      // 播报条目再多也给个绝对上限（防止长会话把内存吃掉）
+      const speeches = [...ledger.values()].filter((item) => item.kind === 'speech');
+      if (speeches.length > 600) {
+        speeches.sort((a, b) => a.seq - b.seq);
+        for (const one of speeches.slice(0, speeches.length - 600)) ledger.delete(one.id);
       }
       scheduleHistorySave();
     }
@@ -562,6 +1278,7 @@ export function apply(ctx, config = {}) {
         done: true,
         error: '',
         wake: null,
+        kind: 'pause',
         pauseMs: Math.max(200, Math.min(PAUSE_MAX_MS, Math.round(Number(ms) || 0))),
       };
       remember(entry);
@@ -575,6 +1292,14 @@ export function apply(ctx, config = {}) {
      */
     const pendingLines = [];
     let serverStarting = false;
+    /**
+     * **最近一次"该念却没念成"的记录**。
+     * 以前这些失败只进 `events.log`，界面上永远是"已念"——用户以为模型没说话。
+     * 现在由 `/state.voiceFailure` 交给界面（`{at, reason, count, sample}`），念成功一次就清空。
+     */
+    let lastVoiceFailure = null;
+    /** 客户端时间线的限速窗口（`/client-log` 用）。 */
+    let clientLogWindow = { at: 0, count: 0 };
 
     /** 后台拉起 BreezeTTS 并盯着探活；起来就 flush，超时就丢掉队列（记日志，不静音假象）。 */
 
@@ -598,7 +1323,7 @@ export function apply(ctx, config = {}) {
 
     /** ready（装了且在跑）/ stopped（装了没启动）/ missing（没装）。 */
     async function installState() {
-      if (await tts.healthy()) return { state: 'ready', dir: cfg.installDir || '', script: cfg.startScript || '' };
+      if (await breezeTts().healthy()) return { state: 'ready', dir: cfg.installDir || '', script: cfg.startScript || '' };
       const script = String(cfg.startScript || '');
       const scriptExists = script ? existsSync(script) : false;
       return { state: scriptExists ? 'stopped' : 'missing', dir: cfg.installDir || '', script };
@@ -967,31 +1692,72 @@ export function apply(ctx, config = {}) {
       }
     }
 
+    /**
+     * **引擎起不来这件事必须有人知道，而且必须能自愈。**
+     *
+     * 以前的三处毛病（朋友现场日志里逐条对上）：
+     *  ① `startServer()` 一律 3 分钟节流、失败也不清 → 第一次没拉起来，后面三分钟全 `spawn=false`；
+     *  ② `spawn=false` 之后照样 `while` 空等 90 秒 —— 等一个根本没被启动的服务；
+     *  ③ 超时后把整批台词 `shift()` 丢掉，**只写一行日志**，界面还写着"起来后自动补念"。
+     *
+     * 现在：`spawn=false` 时不再干等，改为**在等待窗口内到点补拉一次**（`force`）；
+     * 就绪回报 `markServerReady()`（节流恢复 3 分钟）、超时回报 `markServerFailed()`（退避缩到 15 秒）；
+     * 丢掉的每一句都记进 `lastVoiceFailure`，由 `/state` 交给界面显示。
+     */
     function kickServer() {
       if (serverStarting) return;
       serverStarting = true;
       const startedAt = Date.now();
-      const spawned = tts.startServer();
-      note('server:start', `spawn=${spawned} waitMs=${cfg.startWaitMs || 90000}`);
+      const waitMs = Number(cfg.startWaitMs || 90000);
+      const spawned = breezeTts().startServer();
+      note('server:start', `spawn=${spawned} waitMs=${waitMs}`);
       void (async () => {
-        const deadline = Date.now() + Number(cfg.startWaitMs || 90000);
+        const deadline = startedAt + waitMs;
+        let forced = false;
         while (Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 1500));
-          if (await tts.healthy()) {
+          if (await breezeTts().healthy()) {
             serverStarting = false;
+            breezeTts().markServerReady();
             note('server:ready', `${Date.now() - startedAt}ms`);
             await flushPending();
             return;
           }
+          // 节流到点还没起来 → 补拉一次（只补一次，免得刷出一堆控制台窗口）
+          if (!forced) {
+            const info = breezeTts().spawnInfo();
+            if (info.retryInMs <= 0) {
+              forced = true;
+              const again = breezeTts().startServer(true);
+              note('server:retry-spawn', `spawn=${again} after=${Date.now() - startedAt}ms failedWindow=${info.failed}`);
+            }
+          }
         }
         serverStarting = false;
-        tts.lastError = `BreezeTTS 没能在 ${Math.round((cfg.startWaitMs || 90000) / 1000)} 秒内起来（${cfg.startScript}）`;
-        note('server:timeout', tts.lastError);
-        while (pendingLines.length) {
-          const dropped = pendingLines.shift();
-          note('server:drop', dropped.cleaned.slice(0, 60));
-        }
+        breezeTts().markServerFailed();
+        const bootFailure = `BreezeTTS 没能在 ${Math.round(waitMs / 1000)} 秒内起来（${cfg.startScript || '未配置 startScript'}）`;
+        breezeTts().lastError = bootFailure;
+        note('server:timeout', bootFailure);
+        dropPending(`engine-timeout: ${bootFailure}`);
       })();
+    }
+
+    /**
+     * **丢弃要留证**。以前只写一行 `server:drop`，
+     * 界面却挂着"起来后自动补念"——用户以为模型没说话。
+     * 现在把"什么时候、为什么、丢了几句、第一句是什么"记进 `lastVoiceFailure`，`/state` 交给界面显示。
+     */
+    function dropPending(reason) {
+      const count = pendingLines.length;
+      if (!count) return 0;
+      const sample = String(pendingLines[0]?.cleaned || '').slice(0, 40);
+      while (pendingLines.length) {
+        const dropped = pendingLines.shift();
+        note('server:drop', dropped.cleaned.slice(0, 60));
+      }
+      lastVoiceFailure = { at: new Date().toISOString(), reason, count, sample };
+      note('voice:dropped', `count=${count} reason=${reason}`);
+      return count;
     }
 
     /** 端点就绪后把攒着的话一句句念出来（走同一条串行队列）。 */
@@ -1017,30 +1783,58 @@ export function apply(ctx, config = {}) {
      */
     async function enqueueLine(text, sessionId, spec, extra) {
       const parts = splitPause(text);
-      const build = (value) => ({ text: value, instructions: extra?.instructions, cfg_scale: extra?.cfg_scale });
-      const turnHint = extra?.turn;
-      const onlyText = parts.length === 1 && parts[0].type === 'text';
-      if (onlyText) {
-        return [await speakOnce(build(parts[0].text), sessionId, spec, turnHint)];
-      }
+      /*
+       * T5：**长文本切片**，让合成与播放并行。
+       *
+       * 本机引擎串行，一整段 40 秒的播报要等整段合成完才开口；机器一忙（开着游戏）合成掉到 1× 以下，
+       * 句中就垫底。切成 40~70 字一片之后，B 片在合成时 A 片已经在播 —— 只要单片合成快于单片播放，就永不垫底。
+       *
+       * 片与片之间**不留气口** 同一个 `pieceGroup` 的片由客户端背靠背播（`segmentGapMs` 只在不同段之间用），
+       * 否则每片之间插 500 ms 会把"抗卡顿"换成"一句一顿"，更难受。
+       *
+       * ⚠ 这里**不能**再对"只有一块文本"提前 return —— 第一版就写了那个早退，于是最常见的情况
+       * （一句话、没有 `[停顿N秒]`）根本不走切片，自测直接抓到。
+       */
+      const chunkMax = Number(cfg.chunkChars) || 0;
       const results = [];
       for (const part of parts) {
         if (part.type === 'pause') {
           pushPause(part.ms, sessionId, turnHint);
           results.push({ status: 'queued', chars: 0, pauseMs: part.ms });
-        } else {
-          results.push(await speakOnce(build(part.text), sessionId, spec, turnHint));
+          continue;
+        }
+        let pieces = [part.text];
+        if (chunkMax >= 20) {
+          const split = splitForChunking(part.text, chunkMax);
+          if (split.length) pieces = split;
+        }
+        if (pieces.length > 1) {
+          note('chunk:split', `chars=${String(part.text).length} pieces=${pieces.length} max=${chunkMax} sizes=${pieces.map((one) => one.length).join(',')}`);
+        }
+        const group = pieces.length > 1 ? nextPieceGroup() : '';
+        for (let i = 0; i < pieces.length; i += 1) {
+          const meta = group ? { pieceGroup: group, pieceIndex: i + 1, pieceCount: pieces.length } : null;
+          // G0（0.96.0）：一次性风格参数跟着这一行往下走（同一句话被切开时，每一块都带同一套）
+          results.push(await speakOnce({
+            text: pieces[i],
+            instructions: extra?.instructions,
+            cfg_scale: extra?.cfg_scale,
+            style: extra?.style,
+          }, sessionId, spec, extra?.turn, meta));
         }
       }
       return results;
     }
 
-    function startStreaming(cleaned, overrides, sessionId, turnHint) {
+    function startStreaming(cleaned, overrides, sessionId, turnHint, pieceMeta) {
+      // A2：云端引擎不认本机音色名，进合成前先换成它认得的（或干脆不发）。
+      if (overrides) overrides.voice = voiceForEngine(overrides.voice);
       seq += 1;
       const id = `${seq}-${createHash('sha1').update(`${cleaned}|${Date.now()}`).digest('hex').slice(0, 8)}`;
       const entry = {
         id,
         seq,
+        kind: 'speech',
         // 兜底播报是在 turn/end 之后异步跑的，那时 turnState 已经删掉，
         // 以前这里会落到 turn=0 —— 于是 /turn 按轮次查不到，按钮就报"这一轮没有语音"。
         turn: Number(turnHint ?? turnState.get(sessionId)?.turn ?? 0),
@@ -1050,6 +1844,10 @@ export function apply(ctx, config = {}) {
         ms: 0,
         cached: false,
         session: sessionId || '',
+        // T5：这一条是某一段的第几片（多片时才非空）—— 客户端据此"背靠背播、不插气口"
+        pieceGroup: pieceMeta?.pieceGroup || '',
+        pieceIndex: Number(pieceMeta?.pieceIndex) || 0,
+        pieceCount: Number(pieceMeta?.pieceCount) || 0,
         chunks: [],
         done: false,
         error: '',
@@ -1064,9 +1862,24 @@ export function apply(ctx, config = {}) {
       };
       void (async () => {
         try {
+          // **音色先对齐，再开口**。
+          // 以前：`state.json` / `cast.json` 里留着一个引擎声音库里没有的 id（朋友现场是 `wenrou3`）→
+          // 每句都先 404 一次，再走"设计模式"重念；而重念那次会把已经吐出去的 chunk 清空
+          // （下面是 `entry.chunks.length = 0`），客户端手里就是一段坏流 → 很可能整体重拉。
+          // 现在开口前用 60 秒缓存的音色清单校验一次：不在库里就直接走设计模式，并记一行 `voice:not-live`。
+          if (tts.engine.kind === 'breeze' && overrides && overrides.voice) {
+            const items = await listVoices().catch(() => []);
+            const ids = (Array.isArray(items) ? items : []).map((v) => v && v.id).filter(Boolean);
+            if (ids.length && !ids.includes(overrides.voice)) {
+              const preset = String(cfg.voicePreset || '');
+              const next = preset && ids.includes(preset) ? preset : '';
+              note('voice:not-live', `${overrides.voice} 不在引擎声音库（${ids.length} 个）→ ${next || '(设计模式)'}`);
+              overrides.voice = next;
+            }
+          }
           let result;
           try {
-            result = await tts.enqueue(() => tts.synthesizeStream(cleaned, overrides, push));
+            result = await withEngineFallback((inst) => inst.enqueue(() => inst.synthesizeStream(cleaned, overrides, push)));
           } catch (error) {
             const message = String((error && error.message) || error);
             const effectiveVoice = overrides.voice === undefined ? cfg.voice : overrides.voice;
@@ -1083,10 +1896,24 @@ export function apply(ctx, config = {}) {
           entry.file = result.file;
           entry.ms = result.ms;
           entry.cached = Boolean(result.cached);
+          // P1：这句话在发出去之前被擦掉了什么（模型在用别家引擎的记号时，这里是唯一线索）
+          {
+            const droppedList = (result && result.sanitize && result.sanitize.dropped) || [];
+            if (droppedList.length) {
+              note('speak:sanitize', `engine=${tts.engine.id} kind=${tts.engine.kind} dropped=${droppedList.length} [${droppedList.slice(0, 6).join(', ')}]`);
+            }
+          }
+          // A3：云端这次真的用某个音色念出来了 → 记进该 provider 的「用过的音色」，
+          // 面板的音色下拉就会带上它（下次不用凭记忆手打）。
+          if (tts.engine.kind !== 'breeze' && overrides.voice) rememberVoice(tts.engine.id, overrides.voice);
           scheduleHistorySave();
           tts.lastError = '';
+          // 这一句真的念成了 → 清掉"上次没念成"的告警
+          if (lastVoiceFailure) lastVoiceFailure = null;
         } catch (error) {
           entry.error = String((error && error.message) || error);
+          // 失败的这一段**要能被看到**，不能只躺在 events.log 里
+          lastVoiceFailure = { at: new Date().toISOString(), reason: entry.error, count: 1, sample: cleaned.slice(0, 40) };
           tts.lastError = entry.error;
           note('stream:error', entry.error);
         } finally {
@@ -1486,7 +2313,20 @@ export function apply(ctx, config = {}) {
       return voiceForSession(sessionId) || '-';
     }
 
-    async function speakOnce(input, sessionId, spec, turnHint) {
+    /**
+     * 上一次"该念却没念成"，要在下一次 `speak` 的回执里带回去。
+     * 不这么做的话，模型永远以为每一句都念了（朋友现场就是这样：多轮无声、模型毫不知情）。
+     * 超过 10 分钟的老账不再提，免得每轮都翻旧账。
+     */
+    function voiceFailureNote() {
+      if (!lastVoiceFailure) return '';
+      const at = Date.parse(lastVoiceFailure.at || '');
+      if (Number.isFinite(at) && Date.now() - at > 10 * 60 * 1000) return '';
+      const why = String(lastVoiceFailure.reason || '').replace(/^engine-timeout:\s*/, '');
+      return `⚠ 上次有 ${lastVoiceFailure.count} 句没念成：${why}`;
+    }
+
+    async function speakOnce(input, sessionId, spec, turnHint, pieceMeta) {
       syncTone();
       const cleaned = capText(cleanForSpeech(input?.text), effectiveMaxChars());
       if (!cleaned) return { status: 'error', reason: '没有可念的文字', chars: 0 };
@@ -1508,9 +2348,28 @@ export function apply(ctx, config = {}) {
       }
       if (input?.instructions) overrides.instructions = input.instructions;
       if (input?.cfg_scale !== undefined && input?.cfg_scale !== null) overrides.cfg_scale = input.cfg_scale;
+      /*
+       * G0（0.96.0）：**一次性**风格参数。
+       *
+       * 只写进这一次的 `overrides`，绝不碰 `cfg` / `provider.style` / `state.json` ——
+       * 下一次不传就回到面板上的全局风格（合并顺序 `overrides > style > cfg` 在 lib 的 `resolveParams()` 里）。
+       * 所以没有"清理"这回事，也没有开关：传了就是这一次，不传就是默认。
+       * 白名单与夹值走 `pickCallStyle()`（与面板的 `coerceStyle()` 同源）；这家认不认识由 `sanitizeForEngine()` 判。
+       */
+      const style = input?.style && typeof input.style === 'object' ? pickCallStyle(input.style) : null;
+      if (style && Object.keys(style).length) {
+        for (const [key, value] of Object.entries(style)) overrides[key] = value;
+        note('speak:style', `keys=${Object.keys(style).join('+')} engine=${tts.engine.id} chars=${cleaned.length}`);
+      }
+
+      // （A2）：云端引擎不套本机那套探活/自启/安装引导 —— 直接开播，
+      // 失败交给 `withEngineFallback` 与兜底链（`10` §6）。
+      if (tts.engine.kind !== 'breeze') {
+        return startStreaming(cleaned, overrides, sessionId, turnHint, pieceMeta);
+      }
 
       if (await tts.healthy()) {
-        return startStreaming(cleaned, overrides, sessionId, turnHint);
+        return startStreaming(cleaned, overrides, sessionId, turnHint, pieceMeta);
       }
 
       if (!cfg.autoStartServer) {
@@ -1627,7 +2486,7 @@ export function apply(ctx, config = {}) {
       const id = String(name || '').trim();
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(id)) throw new Error('音色名只能用字母 / 数字 / - / _（1~32 位）');
       const refText = String(text || '').trim() || PRESET_REF_TEXT;
-      const art = await tts.enqueue(() => tts.synthesize(refText, {
+      const art = await breezeTts().enqueue(() => breezeTts().synthesize(refText, {
         voice: '',
         instructions: String(tone || '').trim(),
         seed: Number.isFinite(Number(seed)) ? Number(seed) : null,
@@ -1652,8 +2511,8 @@ export function apply(ctx, config = {}) {
       const name = String(key || '').trim().toLowerCase();
       const preset = PRESET_VOICES[name];
       if (!preset) throw new Error(`没有这个出厂预设：${key}（可选 ${Object.keys(PRESET_VOICES).join(' / ')}）`);
-      if (!(await tts.healthy())) {
-        await tts.ensureServer?.().catch(() => {});
+      if (!(await breezeTts().healthy())) {
+        await breezeTts().ensureServer?.().catch(() => {});
       }
       const have = await savedVoiceIds();
       let imported = false;
@@ -1750,11 +2609,21 @@ export function apply(ctx, config = {}) {
         : (fullRead ? FULL_READ_BUDGET : verbalBudget(state));
       const persona = cfg.fallback === 'roleplay' ? personaBlock() : '';
       const cast = cfg.fallback === 'roleplay' ? readCast() : [];
-      // 角色扮演不设段数上限（用户要求）：只要有角色卡就允许模型按情绪/场景自行分段
+      /*
+       * 2026-11-18：**"兜底 / 即兴"这条路上也得执行段数上限**。
+       *
+       * 原来写的是 `cfg.fallback === 'roleplay' ? (persona ? Number.POSITIVE_INFINITY : 1) : …` ——
+       * 那是  时代的老裁决（"角色扮演只要有角色卡就让模型自行分段"），
+       * 而 Q21/Q25（/）早已把它改成"**强度决定段数与篇幅**"：弱 1 段 / 中 ≤3 段 / 强不限。
+       * 代码没跟上，于是"角色扮演 + 弱强度"能播出整整九段。
+       * 现在：**提示词按档位要段数**，事后再在 `decideLines()` 里按同一档位**合并兜底**
+       * （合并语义见 `lib/tts.mjs` 的 `mergeSegmentsDown()` —— 两条路共用一个实现）。
+       */
+      const roleplan = cfg.fallback === 'roleplay' ? (ROLEPLAY_STRENGTHS[cfg.strength] || ROLEPLAY_STRENGTHS.medium) : null;
       const maxSegments = summary
         ? segmentPlan(state).count
         : (cfg.fallback === 'roleplay'
-          ? (persona ? Number.POSITIVE_INFINITY : 1)
+          ? (Number(roleplan?.maxSegments) > 0 ? Number(roleplan.maxSegments) : Number.POSITIVE_INFINITY)
           : (fullRead ? FULL_READ_MAX_SEGMENTS : segmentPlan(state).count));
       // 多音色只看界面开关。关掉时哪怕 cast.json 还有内容，也不许按角色分嗓子
       const multiVoice = Boolean(cfg.multiVoice) && cast.length > 0;
@@ -2306,7 +3175,20 @@ export function apply(ctx, config = {}) {
             if (boosted !== first.segments) {
               note('adapted:min-segments', `strength=${cfg.strength} from=${first.segments.length} to=${boosted.length}`);
             }
-            return toLines(boosted);
+            /*
+             * 2026-11-18：**段数上限的事后兜底**。
+             *
+             * 提示词已经按档位要了段数（弱 1 / 中 ≤3 / 强不限），但模型不一定听 ——
+             * 实测那一轮它给了 9 段。这里按同一档位合并（合并**不丢字**，只改"谁单独成段"），
+             * 与 `speak` 工具那条路用同一个 `mergeSegmentsDown()`。
+             * 顺序不能反：先补下限（强档拆成 ≥2 段）再压上限，否则强档会被压回一段。
+             */
+            const cap = Number(ROLEPLAY_STRENGTHS[cfg.strength]?.maxSegments) || 0;
+            const capped = mergeSegmentsDown(boosted, cap);
+            if (capped !== boosted) {
+              note('adapted:merged-segments', `strength=${cfg.strength} from=${boosted.length} to=${capped.length} max=${cap} chars=${capped.reduce((n, one) => n + String(one.text || '').length, 0)}`);
+            }
+            return toLines(capped);
           }
           return toLines(first.segments);
         }
@@ -2419,11 +3301,49 @@ export function apply(ctx, config = {}) {
       return String(message?.text ?? '');
     }
 
+    /**
+     * 同一事件的**重复投递**去重。
+     *
+     * 病象：`events.log` 里**每一行都写两遍**（同毫秒、同内容），而 `speech` / `turn-stopping` 那几行是单份。
+     * 真因不是写日志的函数被调了两次，而是**同一个 handler 被注册在两个作用域上** 
+     * `ctx.on('session/event', …)`（root）+ `agent.ctx.on('session/event', …)`（每个 agent 一条，第三路兜底）——
+     * 两路都投递，于是 `onSessionEvent()` 里的每个 `note()` 都写两次。`speech` 只写一份纯属侥幸：
+     * `scheduleSpeech()` 自带 `scheduled` 去重，第二次直接 return，没走到 `note()`。
+     *
+     * 修法**不删任何一路**（第三路是"scoped 派发才可达"的保底，删了可能在别的 DSH 版本上整条哑掉），
+     * 而是让 handler 幂等，两个互补判据：
+     *  ① **按事件对象身份**（`WeakSet`）—— 两路投递的若是同一个对象，第二次直接返回；
+     *  ② **按时间** agent 那一路只在"root 刚刚没处理过"时才干活（50 ms 闸门）。
+     *     这一条是为①不成立（两路各自造了新对象）准备的，同时**保住第三路的原意** 
+     *     root 整条不投递时 `lastRootEventAt` 一直是 0，agent 那一路照常工作。
+     */
+    const seenEventObjects = new WeakSet();
+    let lastRootEventAt = 0;
+    let dupSkipped = 0;
+    function alreadyHandled(event, via) {
+      const bump = (detail) => {
+        dupSkipped += 1;
+        if (dupSkipped <= 2 || dupSkipped % 50 === 0) note('session/event:dup', `${detail} skipped=${dupSkipped}`);
+      };
+      if (event && typeof event === 'object' && seenEventObjects.has(event)) {
+        bump(`via=${via}`);
+        return true;
+      }
+      if (via === 'agent' && lastRootEventAt && Date.now() - lastRootEventAt <= 50) {
+        bump('via=agent root-won');
+        return true;
+      }
+      if (event && typeof event === 'object') seenEventObjects.add(event);
+      if (via === 'root') lastRootEventAt = Date.now();
+      return false;
+    }
+
     /** 逐会话跟踪回合状态：谁说过、最后一条正文、走了几步。 */
-    function onSessionEvent(session, event) {
+    function onSessionEvent(session, event, via = 'root') {
       try {
         const sessionId = session?.id ? String(session.id) : '';
         if (!sessionId || !event) return;
+        if (alreadyHandled(event, via)) return;
         const type = event.type;
         if (type === 'turn/start') {
           const fresh = {
@@ -2522,6 +3442,26 @@ export function apply(ctx, config = {}) {
       res.end(body);
     }
 
+    /**
+     * B3（1.0.0）：**原样读请求体**（不解析）。
+     *
+     * 为什么浏览器上传不用 multipart：我们要的只是"一个 wav 文件 + 几个数字"，
+     * 而 multipart 解析是纯粹的额外风险（边界、编码、内存翻倍）。改成"**body 就是 wav 字节、
+     * 参数全在 query 上**"，宿主这边一行解析都不用写，客户端也只需要 `fetch(url, {body: file})`。
+     *
+     * 与 `readBody()`（JSON 专用）并列；上限自己兜（`MAX_UPLOAD_BYTES`）。
+     */
+    async function readRawBody(req, limit) {
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of req) {
+        total += chunk.length;
+        if (limit && total > limit) throw new Error(`上传太大（>${Math.round(limit / 1024 / 1024)} MB）`);
+        chunks.push(chunk);
+      }
+      return Buffer.concat(chunks);
+    }
+
     async function readBody(req) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
@@ -2566,6 +3506,630 @@ export function apply(ctx, config = {}) {
       } catch { /* ignore */ }
     }
 
+    /* ─────────────── G1（0.96.0）：生成页的后端 ───────────────
+     *
+     * 拍板：生成页是**语音素材生产**入口 ——
+     * 写一段文本、按当前引擎调一调、落成 wav 文件，模型也能生成（`tts_generate`，G3 再接）。
+     * 这一层只做四件事，全在 `lib/generated.mjs` 里可测：
+     *   ① 输出目录（面板填，空 = `<dataDir>/generated`），全部读写都锁在这个目录内；
+     *   ② 重名 `xxx` → `xxx-1` → `xxx-2`…（`.wav`/`.mp3` 都算占用，`wx` 写盘防并发覆盖）；
+     *   ③ `generated/index.json` 只追加记账（原子写）；
+     *   ④ 只出 wav，落盘前无条件 `normalizeWav()`（坑 25）。
+     */
+
+    /** 输出目录：面板填了就用它，没填用 `<dataDir>/generated`。 */
+    function generatedDir() {
+      const raw = String((cfg.generated && cfg.generated.dir) || '').trim();
+      return raw ? resolve(raw) : join(dataDir(), 'generated');
+    }
+
+    /** 设置输出目录：必须能建、能写（写一个探针文件再删掉），不可写就不改配置。 */
+    async function setGeneratedDir(raw) {
+      const want = String(raw || '').trim();
+      if (!want) {
+        cfg.generated = { ...(cfg.generated || {}), dir: '' };
+        await persist();
+        return { ok: true, dir: generatedDir() };
+      }
+      const abs = resolve(want);
+      const probe = join(abs, `.write-probe-${process.pid}`);
+      try {
+        await mkdir(abs, { recursive: true });
+        await writeFile(probe, 'ok', 'utf8');
+        await rm(probe, { force: true });
+      } catch (error) {
+        return { ok: false, error: `目录不可写：${(error && error.message) || error}`, dir: generatedDir() };
+      }
+      cfg.generated = { ...(cfg.generated || {}), dir: abs };
+      await persist();
+      note('gen:dir', abs);
+      return { ok: true, dir: abs };
+    }
+
+    /** 一小段 WAV 有多长（毫秒）：给面板显示用，读 `fmt` 的 byteRate 与 `data` 的长度。 */
+    function wavDurationMs(buf) {
+      if (!Buffer.isBuffer(buf) || buf.length < 44) return 0;
+      if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return 0;
+      let pos = 12;
+      let byteRate = 0;
+      while (pos + 8 <= buf.length) {
+        const id = buf.toString('ascii', pos, pos + 4);
+        const len = buf.readUInt32LE(pos + 4);
+        if (id === 'fmt ' && pos + 20 <= buf.length) byteRate = buf.readUInt32LE(pos + 16) || 0;
+        if (id === 'data') {
+          const dataLen = Math.min(len, Math.max(0, buf.length - (pos + 8)));
+          return byteRate ? Math.round((dataLen / byteRate) * 1000) : 0;
+        }
+        pos += 8 + len + (len % 2);
+      }
+      return 0;
+    }
+
+    /** 生成列表：**文件还在**的记录才列（手工删了文件就别留下死条目）。 */
+    /**
+     * 2026-11-18：把"列表/用户给的名字"解析成**真实存在的那个文件**。
+     *
+     * 删除 / 重命名 / 变声取源这三条路原来各自用 `sanitizeGenName()` 洗一遍再拼路径 ——
+     * 而洗名字会**去掉中英文句读** 磁盘上叫 `这是 G3 的落盘验收，.wav`（0.97.0 之前生成的），
+     * 洗完变成 `…验收.wav`，于是"明明在列表里"却**删不掉、改不了名、当不了源**。
+     * `logs/168` 只修了变声那条出口，另外两条漏了 —— 所以这里收成一个函数，谁也别再各写一遍。
+     *
+     * 规则：**先按 `generatedList()` 精确匹配**（`file` / `file + .wav` / 记录的 `name` 三种都认），
+     * 匹配不到才退回"洗名字"（照顾那些只给了个新名字的调用方）。
+     * 返回 `{ file, name }`：`file` 是绝对路径，`name` 是**真实文件名**（记账要用它）。
+     */
+    async function resolveGeneratedName(wantedRaw) {
+      const wanted = String(wantedRaw || '').trim();
+      if (!wanted) return { file: '', name: '' };
+      const dir = generatedDir();
+      const listed = await generatedList().catch(() => ({ items: [] }));
+      const hit = (listed.items || []).find((one) => one
+        && (one.file === wanted || one.file === `${wanted}${GEN_EXT}` || one.name === wanted));
+      if (hit) return { file: join(dir, String(hit.file)), name: String(hit.file) };
+      const washed = sanitizeGenName(wanted.replace(/\.(wav|mp3)$/i, ''), '语音');
+      return { file: join(dir, `${washed}${GEN_EXT}`), name: `${washed}${GEN_EXT}` };
+    }
+
+    async function generatedList() {
+      const dir = generatedDir();
+      const entries = await readGeneratedIndex(dir).catch(() => []);
+      const items = [];
+      for (const one of entries) {
+        const file = String((one && one.file) || '');
+        if (!file) continue;
+        const abs = join(dir, file);
+        if (!withinDir(dir, abs)) continue;
+        let info = null;
+        try {
+          info = await stat(abs);
+        } catch {
+          continue;
+        }
+        items.push({
+          ...one,
+          bytes: info.size,
+          mtime: info.mtimeMs,
+          url: `${ROUTE_PREFIX}gen/${encodeURIComponent(file)}`,
+        });
+      }
+      /*
+       * G4（1.0.8）：`last` 改成**按 `at` 取最新的那条**，不再是"数组最后一个"。
+       *
+       * 以前两者等价（追加写总在末尾），但 G4 允许用户拖拽排序 —— 排序一改，"最后一个"就
+       * 变成"用户排在最下面的那条"，而 `last` 的语义一直是"最近生成的一条"（面板拿它做
+       * 模型生成后的参数回填）。语义绑错了，回填就会填一条几个月前的记录。
+       */
+      const latest = items.reduce((best, one) => {
+        if (!best) return one;
+        return String(one.at || '') > String(best.at || '') ? one : best;
+      }, null);
+      // G5：面板那一行「垃圾桶：N 个 · X MB（上限 …）」直接用这个，不用再发一次请求
+      const trash = await trashStats();
+      return { ok: true, dir, items, last: latest, trash };
+    }
+
+    /**
+     * G5（1.0.9）：**垃圾桶**（`<dataDir>/gen-trash/`）的容量管理与清空。
+     *
+     * 为什么要管：生成页的"删除"是**挪进垃圾桶**而不是抹掉（后悔药），于是它天生只增不减 ——
+     * 不管的话跑半年就是几百 MB 到 GB 躺在盘上。
+     *
+     * 拍板：**自动上限 128 MB 为主 + 手动「清空」为辅**。
+     * 淘汰规则只有一条：**超限就从"最先进桶的"开始删，删到不超为止** ——
+     * 于是"刚删错想找回"天然被保护（最新的最后才轮到），不需要额外的"宽限期"旋钮。
+     *
+     * 一个非显然的坑（`06` 坑 54）：进桶走 `rename`，而 **`rename` 保留内容 mtime**，
+     * 所以垃圾桶里的 mtime 是"生成时刻"而不是"删除时刻"。这里两条一起用：
+     *  · 进桶后 `utimes()` 把 mtime 改写成**现在**（新文件从此语义正确）；
+     *  · 老文件靠文件名里的时间戳兜底（`trashEntryTimeMs()`）。
+     */
+    function trashDirPath() {
+      return join(dataDir(), 'gen-trash');
+    }
+
+    function trashMaxBytes() {
+      const n = Number(cfg.trashMaxBytes);
+      return Number.isFinite(n) && n >= 0 ? n : TRASH_DEFAULT_MAX_BYTES;
+    }
+
+    /** 垃圾桶现状（面板那一行显示它）：`{dir, count, bytes, maxBytes}`。 */
+    async function trashStats() {
+      const dir = trashDirPath();
+      const names = await readdir(dir).catch(() => []);
+      let bytes = 0;
+      let count = 0;
+      for (const name of names) {
+        const info = await stat(join(dir, name)).catch(() => null);
+        if (!info || !info.isFile()) continue;
+        count += 1;
+        bytes += info.size;
+      }
+      return { dir, count, bytes, maxBytes: trashMaxBytes() };
+    }
+
+    /**
+     * 按上限淘汰（best-effort：**永远不抛**，淘汰失败不影响这次删除本身）。
+     * `maxBytes <= 0` = 不限 → 直接返回。
+     */
+    async function pruneTrash(reason = 'auto') {
+      const maxBytes = trashMaxBytes();
+      if (!(maxBytes > 0)) return { ok: true, skipped: 'unlimited' };
+      const dir = trashDirPath();
+      const names = await readdir(dir).catch(() => []);
+      if (!names.length) return { ok: true, dropped: 0, bytes: 0 };
+      const items = [];
+      for (const name of names) {
+        const info = await stat(join(dir, name)).catch(() => null);
+        if (!info || !info.isFile()) continue;
+        items.push({ name, size: info.size, atMs: trashEntryTimeMs(name, info.mtimeMs) });
+      }
+      const plan = planTrashPrune(items, { maxBytes });
+      if (!plan.drop.length) return { ok: true, dropped: 0, bytes: plan.totalBytes };
+      for (const one of plan.drop) {
+        await unlink(join(dir, one.name)).catch(() => {});
+      }
+      note('gen:trash-prune', `reason=${reason} dropped=${plan.drop.length} freed=${plan.dropBytes} left=${plan.keepBytes}/${maxBytes} oldest=${plan.drop[0] ? plan.drop[0].name : '-'}`);
+      return { ok: true, dropped: plan.drop.length, bytes: plan.keepBytes, freed: plan.dropBytes };
+    }
+
+    /** 手动清空：把垃圾桶里剩下的全删（用户点了两下确认才会走到这里）。 */
+    async function emptyTrash() {
+      const dir = trashDirPath();
+      const names = await readdir(dir).catch(() => []);
+      let freed = 0;
+      let count = 0;
+      for (const name of names) {
+        const abs = join(dir, name);
+        const info = await stat(abs).catch(() => null);
+        if (!info || !info.isFile()) continue;
+        const gone = await unlink(abs).then(() => true).catch(() => false);
+        if (gone) {
+          freed += info.size;
+          count += 1;
+        }
+      }
+      note('gen:trash-empty', `count=${count} freed=${freed}`);
+      return { ok: true, count, freed };
+    }
+
+    /** 把一条记录从 index 里去掉（文件名 → 保留剩下的）。 */
+    async function dropGeneratedEntry(dir, file) {
+      const entries = await readGeneratedIndex(dir).catch(() => []);
+      const next = entries.filter((one) => one && one.file !== file);
+      if (next.length !== entries.length) await writeGeneratedIndex(dir, next);
+      return next;
+    }
+
+    /**
+     * G3：把**已经合成好的文件**塞进账目表播一次（不重新合成）。
+     *
+     * 生成页的"试听/生成后自动播"与工具 `tts_generate` 都走它 —— 客户端那边与普通播报
+     * 完全同一条路（`/pending` → `/audio/<id>.wav`），不新增播放逻辑。
+     */
+    function enqueueFile(file, opts = {}) {
+      if (!file) return null;
+      seq += 1;
+      const entry = {
+        id: `${seq}-${createHash('sha1').update(`${file}|${Date.now()}`).digest('hex').slice(0, 8)}`,
+        seq,
+        // 1.2.4：**账目要能分清"这是哪一种播放"**。
+        // `speech` = 播报（重播只认它）；`gen` = 生成页/试听的播放（`turn` 常常是 0，因为它不在任何回合里）；
+        // `pause` = 气口（没有音频）。以前没有这个字段，重播只能"拿最后一条的 turn"，
+        // 于是点重播会把**所有面板生成的音频**（turn=0）从头放一遍。
+        kind: 'gen',
+        turn: Number(opts.turnHint ?? turnState.get(opts.sessionId)?.turn ?? 0),
+        file,
+        text: String(opts.text || ''),
+        chars: Number(opts.chars) || 0,
+        ms: 0,
+        cached: true,
+        session: opts.sessionId || '',
+        chunks: [],
+        done: true,
+        error: '',
+        wake: null,
+      };
+      remember(entry);
+      return entry;
+    }
+
+    /**
+     * G2/G3：生成一段音频。面板（`POST /gen`）与工具 `tts_generate` **共用这一条**，
+     * 所以"参数怎么洗 / 什么时候落盘 / index 记什么 / 播哪一份"只有一份实现。
+     *
+     * 用户拍板的落盘许可（`10` §12）：**能力默认允许，但只有 `save === true` 才写文件** ——
+     * 面板生成 = 用户在要文件（`save` 默认 true）；模型只在用户明确要求时才传 `save:true`。
+     */
+    /** B2：采样参数的键名（snake，与工具 schema / 面板表单一致）。 */
+    const SAMPLING_KEYS = ['temperature', 'top_k', 'top_p', 'repetition_penalty', 'max_new_tokens', 'split_chars'];
+
+    /**
+     * G4（1.0.8）：把这次**实际请求的采样值**摘成 index 字段。
+     *
+     * 只搬"给了"的（`undefined` 跳过）——"没给"必须保持缺席，让 `generatedEntry()` 的 `numOrNull()`
+     * 落成 `null`（坑 42：`Number(null) === 0`，一个假 `0` 会让下次"再生成"带上真的 `temperature:0`）。
+     */
+    function samplingMeta(overrides) {
+      const out = {};
+      for (const key of SAMPLING_KEYS) {
+        if (overrides && overrides[key] !== undefined) out[key] = overrides[key];
+      }
+      return out;
+    }
+
+    /**
+     * B2（0.99.0）：生成**一粒**（合成 → 要存就落盘 → 要不要排队播）。
+     *
+     * 从 `runGenerate()` 里抽出来的唯一原因就是抽卡：2~4 个 seed 各跑一遍同一条流程，
+     * 外层只负责解析参数与汇总。返回里**不含** `genMode` / `engine` / `voice` / `style`
+     * （那些是"这一批"的公共信息，由外层补）。
+     */
+    async function generateOne(text, overrides, opts = {}) {
+      const genMode = opts.genMode;
+      let made;
+      try {
+        made = await withEngineFallback((inst) => inst.enqueue(() => inst.synthesize(text, overrides)));
+      } catch (error) {
+        note('gen:error', `engine=${tts.engine.id} ${(error && error.message) || error}`);
+        return { ok: false, code: 502, error: String((error && error.message) || error) };
+      }
+      const raw = await readFile(made.file).catch(() => null);
+      if (!raw) return { ok: false, code: 500, error: '合成完了却读不到缓存文件' };
+      const durationMs = wavDurationMs(normalizeWav(raw));
+      let saved = null;
+      if (opts.save === true) {
+        try {
+          saved = await saveGeneratedWav({
+            dir: generatedDir(),
+            base: sanitizeGenName(String(opts.name || text.slice(0, 12)), '语音'),
+            buffer: raw,
+            meta: {
+              engineId: tts.engine.id,
+              engineKind: tts.engine.kind,
+              genMode,
+              voice: overrides.voice || '',
+              instructions: overrides.instructions || '',
+              seed: overrides.seed ?? null,
+              cfgScale: overrides.cfg_scale ?? null,
+              // G4：采样六项入账，否则「按这条参数再生成」会静默丢参数（白名单第三次，坑 40）
+              ...samplingMeta(overrides),
+              style: { ...(opts.globalStyle || {}), ...(opts.style || {}) },
+              text,
+              chars: text.length,
+              ms: Number(made.ms) || 0,
+              durationMs,
+              source: opts.source === 'model' ? 'model' : 'user',
+            },
+          });
+        } catch (error) {
+          note('gen:save-fail', String((error && error.message) || error));
+          return { ok: false, code: 500, error: String((error && error.message) || error) };
+        }
+        note('gen:save', `${saved.file} chars=${text.length} mode=${genMode} engine=${tts.engine.id} source=${saved.source} bytes=${saved.bytes}`);
+      }
+      // 播放：落盘了就播落盘那份（与列表里点「播放」是同一个文件），试听就播缓存那份。
+      // `play:false`（抽卡）时**不排队**，面板里点哪条播哪条。
+      const entry = opts.play === false ? null : enqueueFile(saved ? saved.path : made.file, {
+        text,
+        chars: text.length,
+        sessionId: opts.sessionId || '',
+        turnHint: opts.turnHint,
+      });
+      if (opts.play !== false) {
+        note('gen:play', `${entry ? entry.id : '-'} ${saved ? 'saved' : 'preview'} chars=${text.length} mode=${genMode} duration=${durationMs}ms engine=${tts.engine.id}`);
+      }
+      return {
+        ok: true,
+        // `mode` 是既有契约（preview/saved，能不能落盘看它），`genMode` 才是
+        // design/clone/direction/auto —— 两个概念别混，改名会打断 0.97.0 的调用方。
+        mode: saved ? 'saved' : 'preview',
+        chars: text.length,
+        ms: Number(made.ms) || 0,
+        durationMs,
+        cached: Boolean(made.cached),
+        item: saved ? { ...saved, url: `${ROUTE_PREFIX}gen/${encodeURIComponent(saved.file)}` } : null,
+        url: entry ? `${ROUTE_PREFIX}audio/${entry.id}.wav` : '',
+        id: entry ? entry.id : '',
+      };
+    }
+
+    /** B3：变声上传的体积上限（一段 5 分钟的 24k 单声道 wav ≈ 14 MB，留一倍余量）。 */
+    const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
+    /** B3：正在变声的条数（`/state.converting` 用它给面板标"忙"）。 */
+    let convertBusy = 0;
+
+    /**
+     * B3（1.0.0）：**VOICE CHANGER** 的执行核。三个入口在这里合流 ——
+     * 不管源是从生成列表挑的、工具给的本机路径、还是浏览器上传的字节，
+     * 到这儿都是「一个 WAV Buffer + 一串参数」。
+     *
+     * 老规矩一条都不破：默认**只试听**（`save !== true` 不写盘），`save:true` 才落 `generated/`，
+     * 落盘记 `genMode:'changer'` + `keepAcoustic`，播放走同一个 `enqueueFile`。
+     *
+     * `KEEP MELODY`（引擎字段 `keep_acoustic`）：**0 = 说话**（全部声学码本重新生成），
+     * **1~2 = 唱歌**（保留低阶码本、把旋律带过来），**>2 不稳**，面板要写清楚。
+     */
+    async function runConvert(input, opts = {}) {
+      const args = input && typeof input === 'object' ? input : {};
+      const capKind = String((tts && tts.engine && tts.engine.kind) || '');
+      if (capKind !== 'breeze') {
+        return { ok: false, code: 400, error: `当前引擎（${capKind || '未知'}）没有变声接口，切回本机 breeze 再试` };
+      }
+      /*
+       * B3 修补：**变声也要走和播报同一条自愈链**。
+       *
+       * 第一版漏了这一步 —— 引擎崩掉之后变声只会一路 `fetch failed`（连续四次、每次 400/800/1200/1600 ms），
+       * 而**谁都不会去把它拉起来** 播报那边有 `kickServer()`，变声这边没有。用户看到的
+       * 就是"tts 掉线了"，然后无论怎么点都还在报错。
+       */
+      const serverReady = await breezeTts().ensureServer(Number(cfg.startWaitMs) || 90000).catch(() => false);
+      if (!serverReady) {
+        // 后台继续试着拉（与播报共用 `serverStarting` 闸门，不会拉出两个进程）
+        kickServer();
+        return { ok: false, code: 503, error: 'BreezeTTS 没起来（已尝试拉起，仍在后台重试）—— 看看引擎窗口是不是退出了' };
+      }
+      // ── 源音频：三入口合流 ──
+      let sourceBuf = null;
+      let sourceLabel = '';
+      if (Buffer.isBuffer(opts.sourceBuffer) && opts.sourceBuffer.length) {
+        sourceBuf = opts.sourceBuffer;
+        sourceLabel = String(opts.sourceLabel || 'upload.wav');
+      } else if (typeof args.sourceName === 'string' && args.sourceName.trim()) {
+        /*
+         * 2026-11-18：**按"列表里真实存在的文件名"精确匹配**，
+         * 不要拿用户给的名字再过一遍 `sanitizeGenName()` 拼路径。
+         *
+         * 那条路会把文件名里的标点洗掉：磁盘上叫 `这是 G3 的落盘验收，.wav`（带全角逗号，
+         * 0.97.0 之前生成的），洗完变成 `这是 G3 的落盘验收.wav` —— **明明在列表里，却 404**。
+         * 现在先拿 `generatedList()`（它只列"文件还在"的记录）精确比对，匹配不到才退回洗名字，
+         * 这样老文件、怪名字、`name` 与 `file` 混着传都能对。
+         */
+        const wanted = String(args.sourceName).trim();
+        const { file } = await resolveGeneratedName(wanted);
+        const dir = generatedDir();
+        if (!withinDir(dir, file)) return { ok: false, code: 400, error: '路径越界' };
+        sourceBuf = await readFile(file).catch(() => null);
+        sourceLabel = basename(file);
+        if (!sourceBuf) return { ok: false, code: 404, error: `生成列表里没有 ${wanted}（可能已经被删了）` };
+      } else if (typeof args.source === 'string' && args.source.trim()) {
+        const path = String(args.source).trim();
+        if (!/\.wav$/i.test(path)) return { ok: false, code: 400, error: '只收 wav（mp3 等以后再说）' };
+        sourceBuf = await readFile(path).catch(() => null);
+        if (!sourceBuf) return { ok: false, code: 404, error: `读不到 ${path}` };
+        sourceLabel = basename(path);
+      }
+      if (!sourceBuf) {
+        return { ok: false, code: 400, error: '没有源音频：`source`（本机路径）/ `sourceName`（生成列表）/ 直接上传，三选一' };
+      }
+
+      const keepAcoustic = (() => {
+        const raw = args.keep_acoustic ?? args.keepAcoustic;
+        const n = Number(raw);
+        return Number.isFinite(n) ? Math.min(3, Math.max(0, Math.round(n))) : 0;
+      })();
+      /*
+       * 目标音色：**必须显式给**（或退回当前会话音色）。不给的话引擎会以为要设计模式、直接 400 ——
+       * 变声的语义是"换成谁的声音"，没有"随便谁"这一档。
+       */
+      const voice = String(args.voice || '').trim() || String(cfg.voice || '').trim();
+      if (!voice) return { ok: false, code: 400, error: '变声要一个目标音色（库里挑一个）' };
+
+      convertBusy += 1;
+      let made;
+      try {
+        made = await tts.convert({
+          source: sourceBuf,
+          filename: sourceLabel,
+          voice,
+          // 源稿：唱歌时强烈建议给（不给稿，官方实测会把词听成别的）
+          text: typeof args.text === 'string' ? args.text.trim() : '',
+          keepAcoustic,
+          temperature: args.temperature,
+          topK: args.top_k,
+          cfgScale: args.cfg_scale,
+          seed: args.seed,
+        });
+      } catch (error) {
+        note('convert:error', `engine=${tts.engine.id} ${(error && error.message) || error}`);
+        // 失败也踢一次：引擎若是刚崩的，下一次点就自动拉起来了
+        kickServer();
+        return { ok: false, code: 502, error: String((error && error.message) || error) };
+      } finally {
+        convertBusy = Math.max(0, convertBusy - 1);
+      }
+
+      const raw = await readFile(made.file).catch(() => null);
+      if (!raw) return { ok: false, code: 500, error: '转换完了却读不到缓存文件' };
+      const durationMs = wavDurationMs(normalizeWav(raw));
+      let saved = null;
+      if (opts.save === true) {
+        try {
+          saved = await saveGeneratedWav({
+            dir: generatedDir(),
+            base: sanitizeGenName(String(args.name || `${sourceLabel.replace(/\.wav$/i, '')}-变声`), '变声'),
+            buffer: raw,
+            meta: {
+              engineId: tts.engine.id,
+              engineKind: tts.engine.kind,
+              genMode: 'changer',
+              voice,
+              instructions: '',
+              seed: Number.isFinite(Number(made.params && made.params.seed)) ? made.params.seed : null,
+              cfgScale: Number.isFinite(Number(made.params && made.params.cfgScale)) ? made.params.cfgScale : null,
+              // G4：变声这次用的**转换参数**也是"这条记录的参数"——「再生成」要能原样复现，
+              // 包括"源是哪一段"（`fromFile`）与 KEEP MELODY。没有 `fromFile`，回填后源那一格是空的，
+              // 用户只能自己去列表里猜刚才用的是哪条。
+              fromFile: sourceLabel,
+              keepAcoustic,
+              temperature: Number.isFinite(Number(made.params && made.params.temperature)) ? made.params.temperature : null,
+              top_k: Number.isFinite(Number(made.params && made.params.topK)) ? made.params.topK : null,
+              style: {},
+              text: typeof args.text === 'string' ? args.text.trim() : '',
+              chars: String(args.text || '').length,
+              ms: Number(made.ms) || 0,
+              durationMs,
+              source: opts.source === 'model' ? 'model' : 'user',
+            },
+          });
+        } catch (error) {
+          note('convert:save-fail', String((error && error.message) || error));
+          return { ok: false, code: 500, error: String((error && error.message) || error) };
+        }
+        note('convert:save', `${saved.file} keep=${keepAcoustic} voice=${voice} bytes=${saved.bytes} duration=${durationMs}ms engine=${tts.engine.id}`);
+      }
+      const entry = enqueueFile(saved ? saved.path : made.file, {
+        text: `${sourceLabel} → ${voice}`,
+        chars: 0,
+        sessionId: opts.sessionId || '',
+        turnHint: opts.turnHint,
+      });
+      note('convert:play', `${entry ? entry.id : '-'} ${saved ? 'saved' : 'preview'} keep=${keepAcoustic} duration=${durationMs}ms cached=${Boolean(made.cached)}`);
+      return {
+        ok: true,
+        mode: saved ? 'saved' : 'preview',
+        genMode: 'changer',
+        engine: tts.engine.id,
+        engineKind: tts.engine.kind,
+        voice,
+        keepAcoustic,
+        source: sourceLabel,
+        sourceBytes: sourceBuf.length,
+        chars: String(args.text || '').length,
+        ms: Number(made.ms) || 0,
+        durationMs,
+        cached: Boolean(made.cached),
+        item: saved ? { ...saved, url: `${ROUTE_PREFIX}gen/${encodeURIComponent(saved.file)}` } : null,
+        url: entry ? `${ROUTE_PREFIX}audio/${entry.id}.wav` : '',
+        id: entry ? entry.id : '',
+        dir: generatedDir(),
+      };
+    }
+
+    async function runGenerate(input, opts = {}) {
+      const args = input && typeof input === 'object' ? input : {};
+      const text = String(args.text || '').trim();
+      if (!text) return { ok: false, code: 400, error: 'text 必填' };
+      const cap = (tts && tts.caps) || {};
+      const limit = Number(cap.maxChars) || 2000;
+      if (text.length > limit) return { ok: false, code: 413, error: `太长（${text.length} 字，这家上限 ${limit}）` };
+      /*
+       * 风格参数的两种形状都收（面板发嵌套 `style`，工具/speak 习惯平铺）：
+       *   嵌套：`{ text, style: { emotion, speed, timbreWeights } }`
+       *   平铺：`{ text, emotion, speed }`
+       * 平铺的显式值盖住嵌套（`...args` 放后面）。**不在这里判"这家支不支持"** —— 那是 `sanitizeForEngine()` 的活。
+       */
+      const flat = { ...(args.style && typeof args.style === 'object' ? args.style : {}), ...args };
+      const style = coerceStyle(flat);
+      const base = activeRecord();
+      const globalStyle = (base && base.style && typeof base.style === 'object') ? base.style : {};
+      const overrides = { ...style };
+      /*
+       * B1（0.98.0）：模式解析交给 `lib/tts.mjs` 的纯函数（`spike/g0-g1-check.mjs` 直接测）。
+       * 不传 `mode` → `auto` → 与 0.97.0 逐字一致；`design` 不兜会话音色（老 bug 的修法）。
+       */
+      const picked = resolveGenMode({
+        mode: args.mode,
+        voice: args.voice,
+        fallbackVoice: voiceForSession(opts.sessionId || ''),
+        instructions: typeof args.instructions === 'string' ? args.instructions : '',
+        cfgScale: args.cfg_scale,
+      });
+      const genMode = picked.mode;
+      if (genMode === 'direction' && !picked.voice) {
+        return { ok: false, code: 400, error: '指挥模式需要一个音色：库里挑一个，或改成设计模式' };
+      }
+      overrides.voice = picked.voice;
+      if (picked.instructions) overrides.instructions = picked.instructions;
+      else delete overrides.instructions;
+      if (Number.isFinite(Number(args.seed))) overrides.seed = Number(args.seed);
+      if (Number.isFinite(Number(picked.cfgScale))) overrides.cfg_scale = Number(picked.cfgScale);
+      // 云端不认本机音色名 → 合成前换一次（与播报同一条规则）
+      overrides.voice = voiceForEngine(overrides.voice);
+      /*
+       * B2（0.99.0）：采样参数**只搬 snake 键**，转换与夹值统一由 `lib/tts.mjs` 的 `pickSampling()` 做
+       * （`resolveParams()` 里调、`cacheKey()` 也从同一个地方取）—— 宿主不另立一套规则。
+       */
+      for (const key of SAMPLING_KEYS) {
+        if (args[key] !== undefined && args[key] !== null && args[key] !== '') overrides[key] = args[key];
+      }
+      // 抽卡：`seeds` 去重后 1~4 个。**必须落盘** —— 不落盘就没有"挑"的对象。
+      const seeds = Array.isArray(args.seeds)
+        ? [...new Set(args.seeds.map((one) => Math.round(Number(one))).filter((one) => Number.isFinite(one)))].slice(0, 4)
+        : [];
+      const ctx = {
+        name: args.name,
+        save: opts.save === true,
+        source: opts.source,
+        sessionId: opts.sessionId,
+        turnHint: opts.turnHint,
+        style,
+        globalStyle,
+        genMode,
+        // G4a：批量生成要"全部落盘但一条都别播"——`undefined` 保持原来"落盘就播"的行为
+        play: opts.play === false ? false : undefined,
+      };
+      if (seeds.length > 1) {
+        if (ctx.save !== true) return { ok: false, code: 400, error: '抽卡要落盘：传 `save: true` 或换成单个 seed' };
+        const made = [];
+        for (const seed of seeds) {
+          const one = await generateOne(text, { ...overrides, seed }, {
+            ...ctx,
+            // 每粒一个文件：`名字-s7` / `名字-s8`…（洗名字由 `saveGeneratedWav` 内部做）
+            name: `${String(args.name || text.slice(0, 12))}-s${seed}`,
+            // 抽卡**不自动播** 四粒一起进队列会吵成一团，面板里点哪条播哪条
+            play: false,
+          });
+          if (!one.ok) return one;
+          made.push({ ...one, seed });
+        }
+        note('gen:pick', `take=${made.length} seeds=${seeds.join(',')} chars=${text.length} mode=${genMode} engine=${tts.engine.id}`);
+        return {
+          ok: true,
+          genMode,
+          take: made.length,
+          items: made,
+          play: null,
+          chars: text.length,
+          engine: tts.engine.id,
+          engineKind: tts.engine.kind,
+          voice: overrides.voice || '',
+          style,
+          dir: generatedDir(),
+        };
+      }
+      const one = await generateOne(text, overrides, ctx);
+      if (!one.ok) return one;
+      return {
+        ...one,
+        genMode,
+        engine: tts.engine.id,
+        engineKind: tts.engine.kind,
+        voice: overrides.voice || '',
+        style,
+        dir: generatedDir(),
+      };
+    }
+
     async function handler(req, res) {
       const url = new URL(req.url || '/', 'http://127.0.0.1');
       // 兼容两种形态：完整路径 /voice-breeze/state，或 prefix 路由剥离前缀后的 /state
@@ -2574,6 +4138,456 @@ export function apply(ctx, config = {}) {
       else if (path.startsWith('/voice-breeze/')) path = path.slice('/voice-breeze'.length);
 
       try {
+        /* ───────── （A4b）：列出某个 provider 的音色（MiniMax 有真接口，其余给预置清单） ───────── */
+        if (path === '/engine/voices') {
+          const wanted = String(url.searchParams.get('id') || '').trim();
+          const provider = engineConfig().providers.find((one) => one && String(one.id) === wanted) || null;
+          if (!provider) return sendJson(res, 404, { error: '没有这个 provider' });
+          const kindName = coerceKind(provider.kind, provider.baseUrl);
+          if (kindName === 'minimax') {
+            const key = await readEngineKey(wanted);
+            if (!key) return sendJson(res, 400, { error: '这条引擎还没有 key' });
+            try {
+              const base = String(provider.baseUrl || '').trim().replace(/\/+$/, '');
+              // P1：MiniMax 的 `/v1/get_voice` **只认 POST**。
+              // 以前这里写的是 GET → 真机回 `404 page not found`，于是：
+              //   ① 清单永远拉不到（下拉里只剩手填过的那几个音色）；
+              //   ② 探活把 404 当成"地址活着"，key 填错也不报警。
+              // 现在 POST 为主，404/405 时退一次 GET（兼容只认 GET 的自建网关）。
+              const url = `${base}/get_voice`;
+              const askPost = () => fetch(url, {
+                method: 'POST',
+                headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+                body: JSON.stringify({ voice_type: 'all' }),
+                signal: AbortSignal.timeout(8000),
+              });
+              let resp = await askPost();
+              if (resp.status === 404 || resp.status === 405) {
+                resp = await fetch(`${url}?voice_type=all`, {
+                  headers: { authorization: `Bearer ${key}` },
+                  signal: AbortSignal.timeout(8000),
+                });
+              }
+              const data = await resp.json().catch(() => ({}));
+              const pick = (arr, group) => (Array.isArray(arr) ? arr : [])
+                .map((one) => ({
+                  id: String(one?.voice_id || '').trim(),
+                  name: String(one?.voice_name || one?.voice_id || '').trim(),
+                  group,
+                }))
+                .filter((one) => one.id);
+              const items = [
+                ...pick(data.system_voice, 'system'),
+                ...pick(data.voice_cloning, 'cloning'),
+                ...pick(data.voice_generation, 'generation'),
+              ];
+              note('engine:voice-list', `${wanted} ${items.length} 条 http=${resp.status} code=${data?.base_resp?.status_code ?? '-'}`);
+              // 1.2.1：**拉到的清单要落进 provider**，否则生成页的音色下拉永远是空的。
+              const remembered = await rememberVoiceCatalogue(wanted, items.map((one) => one.id)).catch(() => 0);
+              return sendJson(res, 200, { items, remembered, status: data?.base_resp || null });
+            } catch (error) {
+              return sendJson(res, 502, { error: String((error && error.message) || error) });
+            }
+          }
+          // 其余厂商没有清单接口：把预置 + 用过的直接给出去
+          const profile = voiceProfile(provider);
+          return sendJson(res, 200, { items: profile.items.map((v) => ({ id: v, name: v, group: 'preset' })) });
+        }
+
+        /* ───────── G1（0.96.0）：生成页。GET 列表 / 目录；POST 生成 · 改目录 · 重命名 · 删除 ───────── */
+        /* ───────── 2026-11-18：手动启动引擎 ─────────
+         * 用户要一个"自己点一下就能起引擎"的按钮（不必等模型调 speak）。
+         * 幂等 + 防多开：`serverStarting` 闸门在 `kickServer()` 里，起过就 return；
+         * `startServer()` 自己还有 spawn 节流（成功 3 分钟 / 失败 15 秒）。所以连点不会多开。
+         */
+        if (path === '/engine/start') {
+          if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+          const kindNow = String((tts && tts.engine && tts.engine.kind) || '');
+          if (kindNow !== 'breeze') {
+            return sendJson(res, 400, { ok: false, error: '当前引擎不是本机 BreezeTTS，没有可启动的进程' });
+          }
+          if (serverStarting) {
+            note('engine:start-manual', 'already-starting');
+            return sendJson(res, 200, { ok: true, already: true, starting: true, up: false });
+          }
+          if (await breezeTts().healthy()) {
+            note('engine:start-manual', 'already-up');
+            return sendJson(res, 200, { ok: true, already: true, starting: false, up: true });
+          }
+          kickServer();
+          note('engine:start-manual', 'spawn');
+          return sendJson(res, 200, { ok: true, starting: true, up: false });
+        }
+
+        /* ───────── B3（1.0.0）：VOICE CHANGER ─────────
+         * 两种投递方式，**都不用解析 multipart** 
+         *  · `application/json`：`{ sourceName? | source?, voice, keep_acoustic, temperature, top_k,
+         *    cfg_scale, seed, text?, name?, save? }` —— 面板「选列表里的一条」和工具传路径都走它；
+         *  · 其它 content-type：**body 就是 wav 原始字节**，参数全在 query 上
+         *    （`?voice=&keep=&temperature=&top_k=&cfg_scale=&seed=&text=&name=&filename=&save=`）
+         *    —— 浏览器上传走它。宿主一行解析都不用写，客户端也只要 `fetch(url, { body: file })`。
+         */
+        if (path === '/convert') {
+          if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+          const ctype = String(req.headers['content-type'] || '');
+          let payload = {};
+          let sourceBuffer = null;
+          let sourceLabel = '';
+          if (ctype.includes('application/json')) {
+            payload = await readBody(req);
+          } else {
+            try {
+              sourceBuffer = await readRawBody(req, MAX_UPLOAD_BYTES);
+            } catch (error) {
+              return sendJson(res, 413, { ok: false, error: String((error && error.message) || error) });
+            }
+            const q = url.searchParams;
+            const pick = (key) => (q.get(key) === null ? undefined : q.get(key));
+            payload = {
+              // 上传这条路没有 `sourceName`（源就是 body），也**不接受** `source` 路径 ——
+              // 浏览器端不该有能力让宿主去读任意本机文件
+              voice: pick('voice'),
+              keep_acoustic: pick('keep'),
+              temperature: pick('temperature'),
+              top_k: pick('top_k'),
+              cfg_scale: pick('cfg_scale'),
+              seed: pick('seed'),
+              text: pick('text'),
+              name: pick('name'),
+              save: pick('save') !== 'false',
+              session: pick('session'),
+            };
+            sourceLabel = decodeURIComponent(pick('filename') || 'upload.wav').slice(0, 120) || 'upload.wav';
+            if (!sourceBuffer || !sourceBuffer.length) {
+              return sendJson(res, 400, { ok: false, error: '没有收到音频字节' });
+            }
+          }
+          const out = await runConvert(payload, {
+            save: payload.save !== false,
+            source: 'user',
+            sourceBuffer,
+            sourceLabel,
+            sessionId: String(payload.session || ''),
+          });
+          if (!out.ok) return sendJson(res, out.code || 500, { ok: false, error: out.error });
+          note('convert:done', `${out.mode} keep=${out.keepAcoustic} voice=${out.voice} src=${out.source} durationMs=${out.durationMs} bytes=${out.sourceBytes}`);
+          return sendJson(res, 200, {
+            ok: true,
+            dir: out.dir,
+            item: out.item,
+            mode: out.mode,
+            genMode: out.genMode,
+            voice: out.voice,
+            keepAcoustic: out.keepAcoustic,
+            source: out.source,
+            play: { id: out.id, url: out.url },
+            chars: out.chars,
+            ms: out.ms,
+            durationMs: out.durationMs,
+            cached: Boolean(out.cached),
+            engine: out.engine,
+          });
+        }
+
+        if (path === '/gen') {
+          if (req.method === 'GET') return sendJson(res, 200, await generatedList());
+          if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+          const body = await readBody(req);
+          const action = String((body && body.action) || 'generate');
+          const dir = generatedDir();
+
+          if (action === 'dir') {
+            const out = await setGeneratedDir(body && body.dir);
+            const list = await generatedList();
+            // 顺序要紧：`out` 放在后面，否则 `list` 里的 `ok:true` 会把"目录不可写"盖掉（自测抓到的）。
+            return sendJson(res, out.ok ? 200 : 400, { ...list, ...out });
+          }
+
+          if (action === 'rename') {
+            // 先判"有没有给"，再洗 —— `sanitizeGenName('')` 会回兜底名，用它判断"没给"会永远为假。
+            const rawFrom = String(body?.from || '').trim();
+            const rawTo = String(body?.to || '').trim();
+            if (!rawFrom || !rawTo) return sendJson(res, 400, { ok: false, error: 'from / to 必填' });
+            // `from` 是**引用已有文件**（不洗，走统一解析）；`to` 是**新建一个名字**（必须洗）
+            const { file: src, name: fromName } = await resolveGeneratedName(rawFrom);
+            const to = sanitizeGenName(rawTo, '语音');
+            const dst = join(dir, `${to}${GEN_EXT}`);
+            if (!withinDir(dir, src) || !withinDir(dir, dst)) return sendJson(res, 400, { ok: false, error: '路径越界' });
+            if (existsSync(dst)) return sendJson(res, 409, { ok: false, error: `已经有 ${to}${GEN_EXT}（不覆盖，换个名字）` });
+            try {
+              await rename(src, dst);
+            } catch (error) {
+              return sendJson(res, 404, { ok: false, error: `改不了名 ${fromName}：${(error && error.message) || error}` });
+            }
+            const entries = await readGeneratedIndex(dir).catch(() => []);
+            const next = entries.map((one) => (one && one.file === fromName
+              ? { ...one, name: to, file: `${to}${GEN_EXT}` }
+              : one));
+            await writeGeneratedIndex(dir, next);
+            note('gen:rename', `${fromName} → ${to}${GEN_EXT}`);
+            return sendJson(res, 200, await generatedList());
+          }
+
+          if (action === 'delete') {
+            const rawName = String(body?.name || '').trim();
+            if (!rawName) return sendJson(res, 400, { ok: false, error: 'name 必填' });
+            // **不洗名字** 走统一解析，名字里带句读的老文件才删得掉
+            const { file, name } = await resolveGeneratedName(rawName);
+            if (!withinDir(dir, file)) return sendJson(res, 400, { ok: false, error: '路径越界' });
+            // **不直接删干净** 挪到 `<dataDir>/gen-trash/`，用户后悔还找得回来（同场景删除的做法）。
+            const trash = join(dataDir(), 'gen-trash');
+            await mkdir(trash, { recursive: true });
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const stamped = `${name.replace(/\.wav$/i, '')}-${stamp}${GEN_EXT}`;
+            try {
+              await rename(file, join(trash, stamped));
+            } catch (error) {
+              return sendJson(res, 404, { ok: false, error: `删不掉 ${name}：${(error && error.message) || error}` });
+            }
+            /*
+             * G5（1.0.9）：**把 mtime 改写成"现在"**。
+             * `rename` 保留内容 mtime，于是垃圾桶里的 mtime 一直是"生成时刻" ——
+             * 按它淘汰会先删"生成得早、昨天才删"的那些（`06` 坑 54）。
+             * 顺手（异步）跑一次容量淘汰：不用 await —— "删除成功"不该被淘汰的 IO 拖慢或拖挂。
+             */
+            const now = new Date();
+            await utimes(join(trash, stamped), now, now).catch(() => {});
+            void pruneTrash('delete').catch(() => {});
+            await dropGeneratedEntry(dir, name);
+            note('gen:delete', `${name} → gen-trash/${stamped}`);
+            return sendJson(res, 200, await generatedList());
+          }
+
+          /*
+           * G5（1.0.9）：垃圾桶的两个动作。
+           *  · `trash-empty`：**手动清空**（面板两下确认之后才发）—— 用户要的"我现在就要它空"；
+           *  · `trash-prune`：手动跑一次容量淘汰（一般用不到：每次删除后自动淘汰已经跑过；
+           *    留给"我刚把上限改小了，想立刻生效"）。
+           */
+          if (action === 'trash-empty') {
+            const out = await emptyTrash();
+            const list = await generatedList();
+            // 结论字段放最后展开（`06` 坑 37：`{...list, ...out}` 会把 ok 盖掉）
+            return sendJson(res, 200, { ...list, ...out });
+          }
+          if (action === 'trash-prune') {
+            const out = await pruneTrash('manual');
+            const list = await generatedList();
+            return sendJson(res, 200, { ...list, ...out });
+          }
+
+          /*
+           * G4a（1.0.8）：**批量生成** —— 一批文本逐条合成、逐条落盘，**一条都不自动播**。
+           *
+           * 为什么不自动播：N 条一起进队列会吵成一团（与抽卡同一条理由，B2 已定）。
+           * 为什么不并发：引擎是单并发的（`10` §8 第 2 条），并发只会撞 409 然后串行，
+           * 徒增重试与日志噪音 —— 这里就是老实排队。
+           * 一条失败不打断后面（用户填了 10 行，第 3 行太长不该把 7 行一起废掉），
+           * 失败明细逐条回给面板。
+           */
+          if (action === 'batch') {
+            const raw = Array.isArray(body?.texts) ? body.texts : [body?.text ?? ''];
+            const lines = raw
+              .map((one) => String(one ?? '').trim())
+              .filter(Boolean)
+              .slice(0, 20);
+            if (!lines.length) return sendJson(res, 400, { ok: false, error: '批量至少要一行文本' });
+            const prefix = String(body?.namePrefix || body?.name || '').trim();
+            const made = [];
+            const failed = [];
+            for (let i = 0; i < lines.length; i += 1) {
+              // 每行都以"这条记录自己的 text"为准；`namePrefix` 给了就按序号命名，没给就取各自前 12 字
+              const out = await runGenerate({
+                ...body,
+                text: lines[i],
+                seeds: undefined,
+                name: prefix ? `${prefix}-${i + 1}` : undefined,
+              }, {
+                sessionId: String(body?.session || ''),
+                save: true,
+                source: 'user',
+                play: false,
+              });
+              if (!out.ok) {
+                failed.push({ index: i, text: lines[i].slice(0, 40), error: out.error || `HTTP ${out.code || 500}` });
+                continue;
+              }
+              made.push(out.item || null);
+            }
+            note('gen:batch', `take=${made.length} fail=${failed.length} chars=${lines.reduce((n, one) => n + one.length, 0)} engine=${tts.engine.id}`);
+            if (!made.length) {
+              return sendJson(res, 502, { ok: false, error: `批量全部失败：${failed[0]?.error || '未知原因'}`, failed });
+            }
+            return sendJson(res, 200, {
+              ok: true,
+              dir: generatedDir(),
+              take: made.length,
+              items: made.filter(Boolean),
+              failed,
+              mode: 'saved',
+              genMode: 'auto',
+              play: null,
+            });
+          }
+
+          /*
+           * G4c（1.0.8）：**结果列表拖拽排序** —— 只改 `index.json` 的顺序，不动任何文件。
+           *
+           * 排序为什么落在宿主：列表顺序就是 index 的数组顺序（`generatedList()` 原样吐），
+           * 客户端若能直接改那张表，就等于绕过 `lib/generated.mjs` 的落盘层（`10` §8 第 14 条）。
+           * 这里只接受"文件名数组"，`reorderEntries()` 负责去重/丢弃不存在的/补齐剩下的。
+           */
+          if (action === 'reorder') {
+            const order = Array.isArray(body?.order) ? body.order : null;
+            if (!order) return sendJson(res, 400, { ok: false, error: 'order 必填（文件名数组）' });
+            const entries = await readGeneratedIndex(dir).catch(() => []);
+            const next = reorderEntries(entries, order);
+            await writeGeneratedIndex(dir, next);
+            note('gen:reorder', `${entries.length} 条 · 前三个=${next.slice(0, 3).map((one) => one && one.file).join(',')}`);
+            return sendJson(res, 200, await generatedList());
+          }
+
+          /* 生成：走与工具 `tts_generate` 同一条 `runGenerate()`。
+           * 面板这一侧 `save` 默认 true（用户点「生成」就是在要文件）；`save:false` 时只试听不写盘。 */
+          const out = await runGenerate(body, {
+            sessionId: String((body && body.session) || ''),
+            save: !(body && body.save === false),
+            source: (body && body.source === 'model') ? 'model' : 'user',
+          });
+          if (!out.ok) return sendJson(res, out.code || 500, { ok: false, error: out.error });
+          // B2：抽卡（`seeds` 2~4 个）—— 一批文件、**不自动播**，面板里点哪条播哪条
+          if (Array.isArray(out.items)) {
+            note('gen:done', `pick=${out.take} mode=${out.genMode || '-'} dir=${out.dir}`);
+            return sendJson(res, 200, {
+              ok: true,
+              dir: out.dir,
+              take: out.take,
+              items: out.items,
+              mode: out.items[0] ? out.items[0].mode : 'preview',
+              genMode: out.genMode,
+              voice: String(out.voice || ''),
+              play: null,
+              chars: out.chars,
+              engine: out.engine,
+            });
+          }
+          note('gen:done', `mode=${out.genMode || '-'} save=${out.mode} item=${out.item ? out.item.file : '-'} durationMs=${out.durationMs}`);
+          return sendJson(res, 200, {
+            ok: true,
+            dir: out.dir,
+            item: out.item,
+            // 两个 `mode` 别混：`mode` = preview/saved（落不落盘，老契约）；
+            // `genMode` = design/clone/direction/auto（这次用的是哪种生成模式）。
+            mode: out.mode,
+            genMode: out.genMode,
+            voice: String(out.voice || ''),
+            play: { id: out.id, url: out.url },
+            chars: out.chars,
+            ms: out.ms,
+            durationMs: out.durationMs,
+            // B2：命中缓存与否（验"同参数两次"与"改采样不该命中"都靠它）
+            cached: Boolean(out.cached),
+            engine: out.engine,
+          });
+        }
+
+        /* G1：生成出来的音频（**只服务配置目录内的 wav**）。不进缓存、不受 LRU 淘汰。 */
+        if (path.startsWith('/gen/')) {
+          if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method' });
+          let name = '';
+          try {
+            name = decodeURIComponent(path.slice('/gen/'.length));
+          } catch {
+            return sendJson(res, 400, { error: 'bad name' });
+          }
+          if (!/\.wav$/i.test(name)) return sendJson(res, 400, { error: '只出 wav' });
+          const base = name.slice(0, -4);
+          // 只认"洗干净之后还是自己"的名字：挡掉 `..`、路径分隔符、奇怪字符（`sanitizeGenName` 会删非法字符）
+          if (!base || sanitizeGenName(base, '') !== base) return sendJson(res, 400, { error: 'bad name' });
+          const dir = generatedDir();
+          const file = join(dir, `${base}${GEN_EXT}`);
+          if (!withinDir(dir, file)) return sendJson(res, 400, { error: '路径越界' });
+          const raw = await readFile(file).catch(() => null);
+          if (!raw) return sendJson(res, 404, { error: '没有这个文件' });
+          const buf = normalizeWav(raw);
+          const trimmed = raw.length - buf.length;
+          note('gen:serve', `${base}${GEN_EXT} bytes=${buf.length}${trimmed > 0 ? ` trimmed=${trimmed}` : ''}`);
+          return sendWav(req, res, buf, `gen:${base}${GEN_EXT}`);
+        }
+
+        /* ───────── （A2）/ （A3）：引擎切换。GET 看快照；POST 改 active / fallbackEngine / providers ───────── */
+        if (path === '/engine') {
+          if (req.method === 'GET') return sendJson(res, 200, await engineSnapshot());
+          if (req.method === 'POST') {
+            const body = await readBody(req);
+            let changed = false;
+            if (Array.isArray(body.providers)) {
+              const prev = engineConfig().providers;
+              const next = [];
+              for (const raw of body.providers) {
+                const id = String(raw?.id || '').trim();
+                if (!id || id === 'breeze') continue; // breeze 内置，别覆盖
+                const baseUrl = String(raw?.baseUrl || '').trim();
+                if (!/^https?:\/\//i.test(baseUrl)) continue; // 地址不合法就丢掉这一条
+                const before = prev.find((one) => one && String(one.id) === id);
+                const entry = {
+                  id,
+                  kind: coerceKind(raw?.kind, baseUrl),
+                  label: String(raw?.label || id).trim(),
+                  baseUrl,
+                  model: String(raw?.model || 'tts-1').trim(),
+                  defaultVoice: String(raw?.defaultVoice || '').trim(),
+                  audioFormat: 'wav',
+                  supportsInstructions: Boolean(raw?.supportsInstructions),
+                  // A3：成功用过的音色要留住，别每次整组替换就把它们洗掉
+                  knownVoices: Array.isArray(before?.knownVoices) ? before.knownVoices : [],
+                  // 1.2.1：拉下来的整份音色目录同理 —— 它是**服务端拿到的**事实，
+                  // 别让一次"保存引擎设置"把它洗掉（白名单漏字段是这个项目的老病，坑 40）。
+                  voiceCatalogue: Array.isArray(before?.voiceCatalogue) ? before.voiceCatalogue : [],
+                  // P2：这一家的风格参数（洗过白名单；空对象就落空对象，表示"用厂商默认"）
+                  style: coerceStyle(raw?.style),
+                };
+                // 先出声优先：没填音色而这家有预置清单时，自动挑第一个（否则第一次试听就报错）
+                if (!entry.defaultVoice) entry.defaultVoice = voiceProfile(entry).items[0] || '';
+                next.push(entry);
+                // key 进凭据库（拿不到才落 keys/<id>.txt）；**绝不进 state.json、也绝不回显**
+                if (typeof raw?.apiKey === 'string' && raw.apiKey.trim()) {
+                  await writeEngineKey(id, raw.apiKey);
+                }
+                if (raw?.removeKey === true) await deleteEngineKey(id);
+              }
+              // 整组替换时，被删掉的 provider 连 key 一起清掉（避免留下孤儿凭据）
+              for (const gone of prev) {
+                if (gone && !next.some((one) => one.id === gone.id)) await deleteEngineKey(gone.id);
+              }
+              cfg.engine = { ...engineConfig(), providers: next };
+              changed = true;
+            }
+            if (typeof body.active === 'string') {
+              const wanted = body.active.trim() || 'breeze';
+              const known = wanted === 'breeze' || engineConfig().providers.some((one) => one.id === wanted);
+              if (known) {
+                cfg.engine = { ...engineConfig(), active: wanted };
+                changed = true;
+              }
+            }
+            if (typeof body.fallbackEngine === 'string') {
+              const fb = body.fallbackEngine.trim();
+              const known = !fb || fb === 'breeze' || engineConfig().providers.some((one) => one.id === fb);
+              if (known) {
+                cfg.engine = { ...engineConfig(), fallbackEngine: fb };
+                changed = true;
+              }
+            }
+            if (changed) {
+              await persist();
+              rebuildTts();
+              note('engine:switch', `active=${engineConfig().active} fallback=${engineConfig().fallbackEngine || '-'} keyBackend=${credentialsService() ? 'credentials' : 'file'}`);
+            }
+            return sendJson(res, 200, await engineSnapshot());
+          }
+        }
+
         if (path === '/state') {
           if (req.method === 'POST') {
             const body = await readBody(req);
@@ -2646,6 +4660,18 @@ export function apply(ctx, config = {}) {
               cfg.volume = clampVolume(body.volume);
               dirty = true;
             }
+            // 1.0.9：垃圾桶容量上限（字节；0 = 不限）。改小之后**立刻**淘汰一次，
+            // 否则要等下一次删除才生效，用户会觉得"改了没用"。
+            // T5：片长（0 或 20~400）。改完**下一次播报**就生效，不用重启。
+            if (Number.isFinite(body.chunkChars) && body.chunkChars >= 0) {
+              cfg.chunkChars = Math.min(400, Math.round(Number(body.chunkChars)));
+              dirty = true;
+            }
+            if (Number.isFinite(body.trashMaxBytes) && body.trashMaxBytes >= 0) {
+              cfg.trashMaxBytes = Math.round(Number(body.trashMaxBytes));
+              dirty = true;
+              void pruneTrash('config').catch(() => {});
+            }
             // 出厂音色预设（'girl' / 'boy' / ''）——只管记账，真正的切换走 tts_preset
             if (typeof body.voicePreset === 'string') {
               const want = body.voicePreset.trim();
@@ -2667,7 +4693,15 @@ export function apply(ctx, config = {}) {
             narrationMode: cfg.narrationMode,
             scene: (() => { const info = listScenes(); return { active: activeSceneId() || '_default', ids: info.ids }; })(),
             castSize: readCast().length,
+            // B3（1.0.0）：变声进行中（面板据此标"忙"、把播报按钮按下去）
+            converting: convertBusy > 0,
+            // 2026-11-18：面板要判断"该不该显示『启动引擎』" ——
+            // 只有本机 breeze + 端点没起来时才显示，所以把 kind 也交出去
+            engineKind: String((tts && tts.engine && tts.engine.kind) || 'breeze'),
+            engineStarting: Boolean(serverStarting),
             segmentGapMs: Number(cfg.segmentGapMs) >= 0 ? Number(cfg.segmentGapMs) : 500,
+            // T5：长播报切片片长（0 = 不切）。面板「选项」页那一格读它。
+            chunkChars: Number(cfg.chunkChars) || 0,
             bufferSeconds: Number(cfg.bufferSeconds) >= 0 ? Number(cfg.bufferSeconds) : 2,
             controlsInPanel: Boolean(cfg.controlsInPanel),
             volume: clampVolume(cfg.volume),
@@ -2680,9 +4714,18 @@ export function apply(ctx, config = {}) {
             instructions: cfg.instructions,
             cfgScale: cfg.cfgScale,
             voiceUp: await tts.healthy(),
+            // （A3）：客户端据 `engine.kind/voiceMode` 决定音色下拉还列不列本机音色（`15` §4.9）
+            engine: {
+              id: tts.engine.id,
+              kind: tts.engine.kind,
+              label: tts.engine.label,
+              voiceMode: activeVoiceProfile().voiceMode,
+            },
             starting: serverStarting,
             pending: pendingLines.length,
             lastError: tts.lastError,
+            // 最近一次"该念却没念成"（`{at, reason, count, sample}`），界面据此提示
+            voiceFailure: lastVoiceFailure,
             baseUrl: cfg.baseUrl,
             maxChars: effectiveMaxChars(),
             install: await installState(),
@@ -2704,7 +4747,11 @@ export function apply(ctx, config = {}) {
             chars: e.chars,
             ms: e.ms,
             turn: e.turn ?? 0,
+            kind: e.kind || '',
             pauseMs: e.pauseMs || 0,
+            // T5：客户端靠这个判断"下一片是不是同一段的续片"（续片不插气口）
+            pieceGroup: e.pieceGroup || '',
+            pieceIndex: e.pieceIndex || 0,
             url: e.pauseMs ? '' : `${ROUTE_PREFIX}audio/${e.id}.wav`,
           };
         }
@@ -2723,6 +4770,32 @@ export function apply(ctx, config = {}) {
         }
 
         // 消息尾部的重播按钮用 —— 按 messageId 找到那一轮的账目
+        /*
+         * 1.2.4：**「重播最新一轮」的答案由宿主给**。
+         *
+         * 以前客户端自己从 `/pending?since=0` 里取"最后一条"，再按它的 `turn` 分组 ——
+         * 而面板生成的音频（`kind:'gen'`）也在账目里、`turn` 常常是 0（它不属于任何回合），
+         * 于是"重播最新一轮"变成"把 turn=0 的全部音频从头放一遍"（用户听到生成过的十几条依次播）。
+         * 现在：只认 `kind:'speech'` 的最后一条；它的 `turn>0` 就把同一 turn 的播报一起给，
+         * 否则只给这一条。找不到就回空数组，让客户端说"没有可重播的语音"。
+         */
+        if (path === '/replay') {
+          const session = url.searchParams.get('session') || '';
+          const mine = [...ledger.values()]
+            .filter((e) => (!session || e.session === session))
+            .sort((a, b) => a.seq - b.seq);
+          const speeches = mine.filter((e) => (e.kind || 'speech') === 'speech' && !e.pauseMs);
+          const last = speeches[speeches.length - 1];
+          if (!last) return sendJson(res, 200, { turn: 0, session, seq, items: [], reason: 'no-speech' });
+          const turn = Number(last.turn) || 0;
+          const items = (turn > 0
+            ? mine.filter((e) => Number(e.turn) === turn && ((e.kind || 'speech') !== 'gen'))
+            : [last])
+            .map(mapLedgerEntry);
+          note('replay', `session=${session.slice(0, 8)} kind=speech turn=${turn} items=${items.length}`);
+          return sendJson(res, 200, { turn, session, seq, items });
+        }
+
         if (path === '/turn') {
           const message = url.searchParams.get('message') || '';
           const recorded = messageTurn.get(message);
@@ -2737,6 +4810,26 @@ export function apply(ctx, config = {}) {
             .sort((a, b) => a.seq - b.seq)
             .map(mapLedgerEntry);
           return sendJson(res, 200, { turn, session, seq, items });
+        }
+
+        /*
+         * **客户端时间线回传**。
+         *
+         * 起因：同一段音频会被"整段拉两遍"，但浏览器那边发生了什么（同一个 `<audio>` 重拉？
+         * 还是队列里真有两份、起了两个元素？）在宿主日志里完全看不到 —— 只有 `audio:serve` 两行。
+         * 客户端现在把 `play / loadstart / end / error` 四类事件各写一行到这里，落到 `events.log` 的 `client:` 前缀下。
+         * 只收一行短文本、限速 40 行/10 秒，防刷。
+         */
+        if (path === '/client-log' && req.method === 'POST') {
+          const body = await readBody(req);
+          const now = Date.now();
+          if (now - clientLogWindow.at > 10000) clientLogWindow = { at: now, count: 0 };
+          if (clientLogWindow.count < 40) {
+            clientLogWindow.count += 1;
+            const msg = String(body?.msg || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
+            if (msg) note('client', msg);
+          }
+          return sendJson(res, 200, { ok: true });
         }
 
         if (path === '/say' && req.method === 'POST') {
@@ -2911,6 +5004,11 @@ export function apply(ctx, config = {}) {
           if (target === 'data') dir = root;
           else if (target === 'scenes') dir = join(root, 'scenes');
           else if (target === 'cache') dir = join(root, 'cache');
+          // G5（1.0.9）：垃圾桶 —— 面板那行「打开垃圾桶」用（它在 dataDir 之内，走的是普通校验）
+          else if (target === 'gen-trash') dir = trashDirPath();
+          // G1：生成页的「在文件夹中显示」——输出目录可能在 dataDir 之外（用户自己填的），
+          // 所以这里**只认 generatedDir() 本身**，不接受任何拼出来的子路径。
+          else if (target === 'generated') dir = generatedDir();
           else if (target.startsWith('scene:')) {
             const id = target.slice('scene:'.length);
             if (!isSafeSceneId(id)) return sendJson(res, 400, { ok: false, error: 'invalid-scene' });
@@ -2918,9 +5016,11 @@ export function apply(ctx, config = {}) {
           } else {
             return sendJson(res, 400, { ok: false, error: 'invalid-target' });
           }
-          // 双保险：拼出来的路径必须还在 dataDir 之内（防 `..` 之类的手滑）
+          // 双保险：拼出来的路径必须还在 dataDir 之内（防 `..` 之类的手滑）。
+          // G1 例外：生成页的输出目录**允许在 dataDir 之外**（用户自己填的），但只认 `generatedDir()` 这一个值，
+          // 不接受任何拼出来的子路径 —— 也就是说这里放行的仍然是"配置里的那个目录"，不是任意路径。
           const norm = (value) => String(value).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-          if (!norm(dir).startsWith(norm(root))) return sendJson(res, 400, { ok: false, error: 'outside-data-dir' });
+          if (target !== 'generated' && !norm(dir).startsWith(norm(root))) return sendJson(res, 400, { ok: false, error: 'outside-data-dir' });
           await mkdir(dir, { recursive: true });
           try {
             const opener = process.platform === 'win32' ? 'explorer.exe' : (process.platform === 'darwin' ? 'open' : 'xdg-open');
@@ -2933,27 +5033,132 @@ export function apply(ctx, config = {}) {
           }
         }
 
+        /*
+         * G6：**把一段 wav 发给浏览器**，支持 Range，并留下"这次到底发了什么"。
+         *
+         * 为什么非改不可：原来一律 `accept-ranges: none` + 200 全量。媒体元素要跳读时
+         * （缓冲不足、解码器重置、Chrome 自己决定重开），拿不到 206 就只能**从 0 再来一次** ——
+         * 用户听到的就是"播到一半刺啦一下、然后重来 / 变长"。实测证据：同一条音频被整段拉了两次，
+         * 两次相隔 8.2 s，而那段播放时长比音频本身长 8 s。
+         * 现在：`accept-ranges: bytes` + 正经的 206 / 416，媒体栈要哪段给哪段。
+         *
+         * 同时留痕：请求进来记 `audio:req <tag> range=…`；正常写完记 `audio:send`；
+         * **连接在写完之前就断了**记 `audio:abort`（这行是"浏览器中途放弃"的直接证据，以前完全没有）。
+         */
+        function sendWav(req, res, buf, tag) {
+          const total = buf.length;
+          const rangeRaw = String((req.headers && req.headers.range) || '').trim();
+          let status = 200;
+          let start = 0;
+          let end = total - 1;
+          let unsatisfiable = false;
+          if (rangeRaw) {
+            const m = /^bytes=(\d*)-(\d*)$/.exec(rangeRaw);
+            if (m) {
+              if (m[1] === '' && m[2] !== '') {
+                // `bytes=-N`：最后 N 字节
+                const n = Number(m[2]);
+                start = Math.max(0, total - n);
+                end = total - 1;
+              } else if (m[1] !== '') {
+                start = Number(m[1]);
+                end = m[2] === '' ? total - 1 : Number(m[2]);
+              }
+              if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) unsatisfiable = true;
+              else {
+                status = 206;
+                end = Math.min(end, total - 1);
+              }
+            }
+            // 语法不认识（多段 range 等）：按 RFC 可以忽略 Range、直接给整段
+          }
+          note('audio:req', `${tag} range=${rangeRaw || '-'}`);
+          if (unsatisfiable) {
+            note('audio:req-reject', `${tag} 416 range=${rangeRaw} total=${total}`);
+            res.writeHead(416, {
+              'content-range': `bytes */${total}`,
+              'cache-control': 'no-store',
+              'accept-ranges': 'bytes',
+            });
+            return res.end();
+          }
+          const body = status === 206 ? buf.subarray(start, end + 1) : buf;
+          // `typeof` 兜一层：自测用的假 res 没有 `.on`（没这一层，spike 里直接 TypeError）
+          if (typeof res.on === 'function') {
+            res.on('close', () => {
+              // `writableFinished` 为假 = 没写完就断了 —— "浏览器中途放弃"的硬证据
+              if (!res.writableFinished) note('audio:abort', `${tag} total=${total} status=${status}`);
+            });
+          }
+          const headers = {
+            'content-type': 'audio/wav',
+            'content-length': body.length,
+            'cache-control': 'no-store',
+            'accept-ranges': 'bytes',
+          };
+          if (status === 206) headers['content-range'] = `bytes ${start}-${end}/${total}`;
+          res.writeHead(status, headers);
+          if (req.method === 'HEAD') return res.end();
+          res.end(body);
+          note('audio:send', `${tag} status=${status} bytes=${body.length}${status === 206 ? ` of=${total}` : ''}`);
+        }
+
         if (path.startsWith('/audio/')) {
           const id = path.slice('/audio/'.length).replace(/\.wav$/, '');
           const entry = ledger.get(id);
           if (!entry) return sendJson(res, 404, { error: 'unknown audio id' });
 
+          /** 整段给药：带 content-length，浏览器知道自己拿到了多少，不会在任何中间态上瞎猜。 */
+          const serveFile = async (why) => {
+            const raw = await readFile(entry.file).catch(() => null);
+            if (!raw) return sendJson(res, 404, { error: 'audio file missing' });
+            /*
+             * **无条件**过一遍 normalizeWav。
+             *
+             * 根因找到了：MiniMax 在每个 WAV 的 `data` 块**后面**又写了一个 `AIGC` 块
+             * （1078 字节 JSON 元数据，合规水印）。桌面播放器读到 `data` 长度就停，所以本地听着是干净的；
+             * 浏览器会把 `data` 之后那 1086 字节继续当音频解，于是尾部（以及每段收尾）出现刺耳呲拉声。
+             *
+             * `normalizeWav()` 对"只有 fmt + data"的标准文件**原样返回**（缓存里 374 个文件里 366 个原样不动，
+             * 只有 8 个 MiniMax 产出的被裁剪），所以这里可以无条件调，不必看引擎类型。
+             */
+            const buf = normalizeWav(raw);
+            const trimmed = raw.length - buf.length;
+            note('audio:serve', `${id} ${why} bytes=${buf.length}${trimmed > 0 ? ` trimmed=${trimmed}` : ''}`);
+            return sendWav(req, res, buf, `${id}:${why}`);
+          };
+
           // ① 已完成（含缓存命中）：整段给出去，带 content-length，浏览器可 seek
-          if (entry.done && entry.file) {
-            const buf = await readFile(entry.file).catch(() => null);
-            if (!buf) return sendJson(res, 404, { error: 'audio file missing' });
-            res.writeHead(200, {
-              'content-type': 'audio/wav',
-              'content-length': buf.length,
-              'cache-control': 'no-store',
-              'accept-ranges': 'none',
-            });
-            return res.end(buf);
-          }
+          if (entry.done && entry.file) return serveFile('file');
+
           // ② 合成失败：明确告诉客户端，别让它等一个永远不来的流
           if (entry.done) return sendJson(res, 502, { error: entry.error || 'synthesis failed' });
 
-          // ③ 正在流式合成：边到边写（chunked），浏览器边下边播
+          /*
+           * ③ ：**云端引擎不再走 chunked**。
+           *
+           * 用户实测：MiniMax 那几轮播到一半和收尾处有刺耳呲拉声，但同一份缓存文件在本地播放器里是干净的。
+           * 差别就在这里 —— 云端本来就是"整段返回"，我们却把它伪装成流式发给浏览器：
+           * 分块响应没有 content-length，浏览器对"还不知道总长的 WAV"处理方式各异
+           * （MiniMax 的 WAV 里还带一个 LIST/INFO 附加块），于是尾部被解成杂音。
+           * 现在云端一律**等合成完成 → 带 content-length 整段给**，与本机缓存文件完全一致。
+           * 真正需要边生成边播的只有本机 BreezeTTS（它的 wav 头本来就是占位长度，适合流式）。
+           */
+          if (tts.engine.kind !== 'breeze') {
+            const deadline = Date.now() + Math.max(20000, Number(tts.engine.timeoutMs) || 120000);
+            while (!entry.done && Date.now() < deadline) {
+              await new Promise((resolve) => {
+                entry.wake = resolve;
+                setTimeout(resolve, 150);
+              });
+            }
+            if (entry.done && entry.file) return serveFile('waited');
+            if (entry.done) return sendJson(res, 502, { error: entry.error || 'synthesis failed' });
+            return sendJson(res, 504, { error: 'synthesis timeout' });
+          }
+
+          // ④ 本机引擎：正在流式合成，边到边写（chunked），浏览器边下边播
+          note('audio:serve', `${id} stream`);
           res.writeHead(200, {
             'content-type': 'audio/wav',
             'cache-control': 'no-store',
@@ -3071,6 +5276,7 @@ export function apply(ctx, config = {}) {
       let offSaveVoice;
       let offState;
       let offCard;
+      let offGenerate;
       let offQuestion;
       let offApproval;
       let offSection;
@@ -3083,7 +5289,11 @@ export function apply(ctx, config = {}) {
       const problems = [];
       lastProblems = problems;
       try {
-      void restore().then(() => { pruneSceneIndex(); }).catch(() => { /* 恢复失败也要能起来 */ });
+      // restore() 读完盘之后**必须重建适配器**。
+      // cfg 里是代码默认值（active='breeze'），而 `rebuildTts()` 在 apply 时就跑了一次；
+      // 不重建的后果是「盘上 `state.json` 明明写着 active=sf，运行时却一直在用本机引擎」——
+      // 2026-11-16 就是这样：`/state` 回 breeze、`/engine` 回 sf，两个真相打架。
+      void restore().then(() => { pruneSceneIndex(); rebuildTts(); }).catch(() => { /* 恢复失败也要能起来 */ });
 
       const routeHandler = (req, res) => { void handler(req, res); };
       // webServer 的 prefix 匹配规则是 `pathname === prefix || pathname.startsWith(prefix + '/')`，
@@ -3126,6 +5336,7 @@ export function apply(ctx, config = {}) {
           '**只写这个角色自己要说的话**（第一人称对话）：**不要**写旁白、动作、表情、神态、环境（“她把笔记本推过来”“指尖按住那行”这类一律不写）——那些属于正文，不属于语音；语音里只留“这个人正在对我说的话”。',
           '**长度标准表**（这是标准，不是当前值；当前值见 `tts_state`）：角色扮演 + AI 即兴下 **弱 80~160 字 / 1 段**、**中 320~520 字 / 1~3 段**、**强 640~900 字 / ≥2 段**；非角色扮演档是 **弱 20~40 / 中 40~120 / 强 120~240 字**。方向一致：档越强，说得越长。**中、强两档目前没有字数上限**（显式决定，不是漏项），弱档的上限 160 只作规范、宿主暂不裁剪；段数上限由宿主执行——超了会把多出来的段合进最后一段，一个字都不丢。',
           '**平时不要写 `segments[].voice`** 那一项是给"设计音色试听 / 用户明确要求换嗓子"用的。普通播报一律不写 voice，让插件按界面选的那把嗓子念——写了就会盖掉用户的选择。',
+          '**一次性的风格参数** `emotion` / `speed` / `vol` / `pitch` / `voiceModify` **只作用于这一次合成**——不写盘、不用改面板，下一次不传就回到面板的全局风格。想按情景调这一句（急一点 / 沉一点 / 电话音）就直接传；这家引擎认不认识看 `tts_state` 的 `engineHints`，不认识的会被插件擦掉、不会报错。',
         ].join(''),
         parameters: {
           type: 'object',
@@ -3133,6 +5344,26 @@ export function apply(ctx, config = {}) {
             text: { type: 'string', description: '要念出来的中文短句，建议 ≤ 60 字，不要含 Markdown、代码或文件路径。' },
             instructions: { type: 'string', description: '可选：语气/情绪描述，例如「更慢一点，语气严肃」。' },
             cfg_scale: { type: 'number', description: '可选：指令跟随强度（2~3 常用，越大越贴指令但可能刺耳）。' },
+            /*
+             * G0（0.96.0）：一次性风格参数。**只作用于这一次合成**——不写 state.json、不改面板的全局风格，
+             * 下一次不传就回到全局值（合并顺序 overrides > style > cfg）。所以这里没有开关，也没有"恢复"这一步。
+             * 这家引擎认不认识由 `engineCaps()` 判、`sanitizeForEngine()` 在发出去之前擦掉（`03` §2.9.3）。
+             */
+            emotion: { type: 'string', description: '可选：这一次合成的情绪档。只有当前引擎支持的情绪才生效（清单见 `tts_state.engineHints`）；不传就按面板的全局风格。' },
+            speed: { type: 'number', description: '可选：这一次的语速（0.5~2，1=原速）。**想说得"慢"必须动它**——情绪档里没有"更慢"这一项（`calm` 压的是语调，不是时长）。' },
+            vol: { type: 'number', description: '可选：这一次的音量（0.01~10，1=原音量）。' },
+            pitch: { type: 'number', description: '可选：这一次的音调（-12~12，0=原调；负=更低沉）。' },
+            voiceModify: {
+              type: 'object',
+              description: '可选：这一次的音色微调（低沉稳一点、"电话音效"之类）。不认识的引擎会整块丢掉，不会报错。',
+              properties: {
+                pitch: { type: 'number', description: '-100~100；正=更亮，负=更低沉' },
+                intensity: { type: 'number', description: '-100~100；改动强度' },
+                timbre: { type: 'number', description: '-100~100；音色明暗' },
+                soundEffects: { type: 'string', description: '音效名，例如 spacious_echo / auditorium_echo / lofi_telephone / robotic' },
+              },
+              additionalProperties: false,
+            },
             segments: {
               type: 'array',
               description: '可选：一次提交整轮多段演出（角色扮演推荐）。每段可指定 speaker（查 cast.json 取音色）与 tone。**设计音色试听** 每段写 `voice: ""` + `tone`（音色描述）+ 各不相同的 `seed`，一次就能听完多个候选嗓子。',
@@ -3190,14 +5421,17 @@ export function apply(ctx, config = {}) {
             if (v.status === 'queued') {
               return [{
                 type: 'text',
-                text: `🔈 已念（${v.chars} 字${v.ms ? `, ${v.ms}ms` : ''}${v.cached ? ', 缓存' : ''}${suffix}）`,
+                // `note` 里可能是"上次有 N 句没念成"——必须显示出来，
+                // 否则"已念"这三个字会在引擎没起来的时候变成谎话。
+                text: `🔈 已念（${v.chars} 字${v.ms ? `, ${v.ms}ms` : ''}${v.cached ? ', 缓存' : ''}${suffix}）${v.note ? ` · ${v.note}` : ''}`,
               }];
             }
             if (v.status === 'muted') return [{ type: 'text', text: '🔇 语音播报已关闭，这句没有出声' }];
             if (v.status === 'skipped') return [{ type: 'text', text: '📄 全文模式：这句不用单独念，正文会由插件从头念一遍' }];
             if (v.note) return [{ type: 'text', text: `🔈 已念（${v.chars} 字）· ${v.note}` }];
             if (v.status === 'starting') {
-              return [{ type: 'text', text: `⏳ BreezeTTS 正在启动，起来后自动补念（${v.chars} 字）` }];
+              // 顺手把"上次没念成"的旧账也带上，别让这两条信息互相盖住
+              return [{ type: 'text', text: `⏳ BreezeTTS 正在启动，起来后自动补念（${v.chars} 字）${v.note ? ` · ${v.note}` : ''}` }];
             }
             return [{ type: 'text', text: `语音失败：${v.reason || '未知原因'}` }];
           },
@@ -3219,6 +5453,9 @@ export function apply(ctx, config = {}) {
             };
           }
           const sessionId = exec?.agent?.id ? String(exec.agent.id) : '';
+          // G0（0.96.0）：这一次调用要用的风格（没有就是空对象 = 完全按面板的全局风格）。
+          const callStyle = pickCallStyle(args);
+          const styleArg = Object.keys(callStyle).length ? callStyle : undefined;
           // **强度必须真的生效**——角色扮演 + 即兴时，模型自己 speak 偏短就当场按正文扩写（Q24）。
           // 扩写用同一条 verbalize 通道（素材是这一轮正文，不是插件编的话）；正文还没写完就只把目标回给模型。
           let strengthNote = '';
@@ -3239,7 +5476,7 @@ export function apply(ctx, config = {}) {
                     const text = String(seg.text || '').trim();
                     if (!text) continue;
                     const spec = await resolveSegmentVoice({ speaker: seg.speaker, voice: seg.voice, instructions: seg.tone }, sessionId);
-                    await enqueueLine(text, sessionId, spec, { instructions: seg.tone || undefined, turn });
+                    await enqueueLine(text, sessionId, spec, { instructions: seg.tone || undefined, style: styleArg, turn });
                     sum += text.length;
                   }
                   if (sum) {
@@ -3262,18 +5499,16 @@ export function apply(ctx, config = {}) {
           if (Array.isArray(args?.segments) && args.segments.length) {
             // **段数上限**（弱 1 / 中 3 / 强不限，裁决）。超了就把多出来的段**合进最后一段**——
             // 一个字都不少，只改"谁单独成段"，所以听感是连续的一段而不是两段；日志 `speak:merged-segments`。
-            let segs = args.segments;
+            // 2026-11-18：合并实现收进 `lib/tts.mjs` 的 `mergeSegmentsDown()`，与兜底/即兴那条路共用 ——
+            // 之前两条路各写一遍（一条有、一条没有），正是"角色扮演+弱强度播出九段"的成因。
             const maxSeg = Number(rplan?.maxSegments) || 0;
-            if (maxSeg > 0 && segs.length > maxSeg) {
-              const head = segs.slice(0, maxSeg);
-              const tail = segs.slice(maxSeg);
-              const last = head[head.length - 1] || {};
-              const joined = [String(last.text || ''), ...tail.map((seg) => String(seg?.text || ''))].map((t) => t.trim()).filter(Boolean).join(' ');
-              segs = [...head.slice(0, -1), { ...last, text: joined }];
-              note('speak:merged-segments', `from=${args.segments.length} to=${segs.length} strength=${cfg.strength} max=${maxSeg} chars=${joined.length}`);
+            const segs = mergeSegmentsDown(args.segments, maxSeg);
+            if (segs !== args.segments) {
+              note('speak:merged-segments', `from=${args.segments.length} to=${segs.length} strength=${cfg.strength} max=${maxSeg} chars=${segs.reduce((n, one) => n + String(one?.text || '').length, 0)}`);
             }
             let totalChars = 0;
             let queuedCount = 0;
+            let startingCount = 0;
             const trace = [];
             for (const seg of segs) {
               const text = String(seg?.text || '').trim();
@@ -3290,24 +5525,28 @@ export function apply(ctx, config = {}) {
               // 工具路径也逐段记账——事后能查"这一段到底用了哪把嗓子"
               trace.push(`${seg?.speaker || '-'}:${spec.voice || '设计模式'}`);
               note('segment', `via=speak who=${seg?.speaker || '-'} voice=${spec.voice || '设计模式'} seed=${spec.seed ?? '-'} tone=${JSON.stringify((spec.instructions || '').slice(0, 40))} chars=${text.length}`);
-              const ones = await enqueueLine(text, sessionId, spec, { instructions: seg.tone || undefined });
+              const ones = await enqueueLine(text, sessionId, spec, { instructions: seg.tone || undefined, style: styleArg });
               let accepted = false;
               for (const one of ones) {
                 if (one.status === 'queued' || one.status === 'starting') {
                   queuedCount += 1;
+                  if (one.status === 'starting') startingCount += 1;
                   totalChars += Number(one.chars) || 0;
                   accepted = true;
                 }
               }
               if (accepted) markSpoken(sessionId, text);
             }
-            note('speak', `segments=${queuedCount} chars=${totalChars} voices=${trace.join(',') || '-'} strength=${cfg.strength} status=queued`);
+            note('speak', `segments=${queuedCount} chars=${totalChars} voices=${trace.join(',') || '-'} strength=${cfg.strength} engine=${tts.engine.id} style=${Object.keys(callStyle).join('+') || '-'} status=${startingCount === queuedCount ? 'starting' : 'queued'}`);
             const state = turnState.get(sessionId);
             if (state && queuedCount) state.spoke = true;
             if (!queuedCount) return { status: 'error', chars: 0, segments: 0, reason: '没有任何可念的段' };
             // **把当前档位回给模型**。
             return stripUndefined({
-              status: 'queued',
+              // **引擎没起来时不能再报"已念"**。
+              // 以前这一段把 `starting` 一律压成 `queued`，模型和用户都以为发出去了
+              // （实测：杀了引擎仍然显示"🔈 已念（35 字）"）。现在原样透出去，卡片才会说"起来后自动补念"。
+              status: startingCount === queuedCount ? 'starting' : 'queued',
               chars: totalChars,
               segments: queuedCount,
               narrationMode: cfg.fallback === 'roleplay' ? cfg.narrationMode : undefined,
@@ -3316,30 +5555,40 @@ export function apply(ctx, config = {}) {
               fallback: cfg.fallback,
               multiVoice: !!cfg.multiVoice,
               cardDirty: refreshCardDirty() || undefined,
+              engine: tts.engine.id,
               strength: rplan ? cfg.strength : undefined,
               target: rplan ? Number(rplan.targetChars) || undefined : undefined,
               limit: rplan && Number(rplan.maxChars) ? Number(rplan.maxChars) : undefined,
+              note: voiceFailureNote() || undefined,
             });
           }
 
           const ones = await enqueueLine(String(args?.text || ''), sessionId, undefined, {
             instructions: args?.instructions,
             cfg_scale: args?.cfg_scale,
+            style: styleArg,
           });
           const voices = ones.filter((one) => !one.pauseMs);
+          // `starting` 不能再被压成 `queued` —— 引擎没起来时那句其实还没合成。
+          const allStarting = voices.length > 0 && voices.every((one) => one.status === 'starting');
           const result = stripUndefined({
-            status: voices.some((one) => one.status === 'queued' || one.status === 'starting')
+            status: voices.some((one) => one.status === 'queued')
               ? 'queued'
-              : (voices[0]?.status || 'error'),
+              : (allStarting ? 'starting' : (voices[0]?.status || 'error')),
             chars: ones.reduce((sum, one) => sum + (Number(one.chars) || 0), 0),
             segments: voices.length,
             reason: voices.find((one) => one.status === 'error')?.reason,
             strength: rplan ? cfg.strength : undefined,
             target: rplan ? Number(rplan.targetChars) || undefined : undefined,
             limit: rplan && Number(rplan.maxChars) ? Number(rplan.maxChars) : undefined,
-            note: strengthNote || undefined,
+            note: [strengthNote, voiceFailureNote()].filter(Boolean).join(' · ') || undefined,
+            engine: tts.engine.id,
           });
-          note('speak', `chars=${result.chars || 0} voice=${overridesForLog(args, sessionId)} strength=${cfg.strength} status=${result.status}`);
+          // 日志里 `voice=` 是"请求的嗓子"（界面/模型要的），`sent=` 是**实际发给引擎的**——
+          // 云端下这两者会不一样（本机音色名在云端不存在，会被换成 defaultVoice 或干脆不发）。
+          const requestedVoice = overridesForLog(args, sessionId) || '-';
+          const sentVoice = voiceForEngine(overridesForLog(args, sessionId)) || '(不发)';
+          note('speak', `chars=${result.chars || 0} voice=${requestedVoice} sent=${sentVoice} strength=${cfg.strength} engine=${tts.engine.id} style=${Object.keys(callStyle).join('+') || '-'} status=${result.status}`);
           if (result.status === 'queued' || result.status === 'starting') {
             const state = turnState.get(sessionId);
             if (state) state.spoke = true;
@@ -3523,7 +5772,10 @@ export function apply(ctx, config = {}) {
         },
         async execute(_args, exec) {
           const sessionId = exec?.agent?.id ? String(exec.agent.id) : '';
-          const ready = await tts.ensureServer(Number(cfg.startWaitMs) || 90000);
+          // A2：当前引擎是云端时，本机引擎跟这次试听无关 —— 不要傻等它（那是 90 秒的空转）。
+          const ready = tts.engine.kind === 'breeze'
+            ? await breezeTts().ensureServer(Number(cfg.startWaitMs) || 90000)
+            : true;
           if (!ready) {
             const inst = await installState();
             return {
@@ -3669,8 +5921,9 @@ export function apply(ctx, config = {}) {
       offState = ctx.tools.register({
         name: 'tts_state',
         description: [
-          '只读：返回**当前**的语音播报设置——档位（strength）、目标字数、字数上限、段数上下限、模式、朗读方式、当前嗓门、多音色、场景、音量。',
+          '只读：返回**当前**的语音播报设置——档位（strength）、目标字数、字数上限、段数上下限、模式、朗读方式、当前嗓门、多音色、场景、音量，以及**当前引擎能写哪些记号**（`engineHints`）。',
           '**每轮第一次开口之前先调一次** 系统提示词在会话内不刷新（中途改档不会跟实测），所以"现在到底是哪一档"只能从这里拿，其次看上一次 `speak` 的返回。',
+          '`engineHints` 是**当前**语音引擎支持的记号清单（停顿 `<#0.5#>`、括号语气词、情绪档之类，随引擎切换而变）：**只用它列出来的**；没列出来的记号写到别家引擎上会被照字念成噪音。',
           '它不改任何设置、不出声、不写盘；返回的 `strength` / `target` / `limit` / `maxSegments` 就是这一轮该遵守的长度标准。',
         ].join(''),
         parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -3693,6 +5946,15 @@ export function apply(ctx, config = {}) {
               multiVoice: { type: 'boolean' },
               scene: { type: 'string' },
               volume: { type: 'number' },
+              engine: { type: 'string' },
+              engineKind: { type: 'string' },
+              engineLabel: { type: 'string' },
+              engineFallback: { type: 'string' },
+              engineVoiceMode: { type: 'string' },
+              engineNote: { type: 'string' },
+              engineHints: { type: 'array', items: { type: 'string' } },
+              enginePlaybook: { type: 'array', items: { type: 'string' } },
+              engineSupport: { type: 'string' },
             },
           },
           render: (args, value) => {
@@ -3706,6 +5968,10 @@ export function apply(ctx, config = {}) {
               v.maxSegments ? `≤${v.maxSegments}段` : '段数不限',
               `模式=${v.fallback || '-'}`,
               `嗓门=${v.voice || '设计模式'}`,
+              v.engine && v.engine !== 'breeze' ? `引擎=${v.engineLabel || v.engine}` : '',
+              v.engineSupport ? `支持=${v.engineSupport}` : '',
+              v.enginePlaybook && v.enginePlaybook.length ? `手册${v.enginePlaybook.length}条` : '',
+              v.engineVoiceMode === 'manual' ? '⚠ 该引擎没有音色清单，音色选项已隐藏' : '',
             ].filter(Boolean);
             return [{ type: 'text', text: `🎛 ${parts.join(' · ')}` }];
           },
@@ -3730,10 +5996,21 @@ export function apply(ctx, config = {}) {
             limit: plan && Number(plan.maxChars) ? Number(plan.maxChars) : undefined,
             minSegments: plan ? Number(plan.minSegments) || 1 : 1,
             maxSegments: plan ? Number(plan.maxSegments) || 0 : 0,
-            voice: voiceForSession(sessionId) || cfg.voice || '',
+            voice: voiceForEngine(voiceForSession(sessionId) || cfg.voice || ''),
             multiVoice: !!cfg.multiVoice,
             scene: activeSceneId() || '',
             volume: Number(cfg.volume) || 0,
+            engine: tts.engine.id,
+            engineKind: tts.engine.kind,
+            engineLabel: tts.engine.label,
+            engineFallback: engineConfig().fallbackEngine || undefined,
+            // A3（`15` §4.9）：云端没有音色清单时，模型要把「谁 / 为什么藏了 / 想换怎么办」讲给用户听
+            engineVoiceMode: activeVoiceProfile().voiceMode,
+            engineNote: activeVoiceProfile().guidance || undefined,
+            // P1：当前引擎认识哪些记号（随引擎变，所以只能靠工具返回，不能写进提示词）
+            engineHints: engineHints(),
+            enginePlaybook: enginePlaybookLines(),
+            engineSupport: engineSupportLine(),
           });
         },
       });
@@ -3801,6 +6078,275 @@ export function apply(ctx, config = {}) {
         note('tools:card-fail', String((error && error.message) || error));
       }
 
+      /* ───────── G3：生成音频的工具（与面板「生成」页同一条 `runGenerate()`） ───────── */
+      try {
+      problems.push('tool: start tts_generate');
+        problems.push('tool: start tts_convert');
+      offGenerate = ctx.tools.register({
+        name: 'tts_generate',
+        description: [
+          '把一段文本合成为**音频成品**（不是"念给用户听"的播报，而是"可以做素材的音频"）。',
+          '**默认只试听、不落盘** 合成 + 在窗口里播一遍，返回时长与字节，不写文件、不进列表。',
+          '**只有用户明确要求"存下来 / 给我一个音频文件 / 导出一段"时才传 `save: true`** —— 这是用户定的硬规则（`10` §12）：',
+          '能力默认允许，但落盘必须由用户那句话触发。别自作主张替用户存文件。',
+          '落盘后文件进「生成」页的结果列表（`source:"model"`），用户可以在面板里微调参数再生成。',
+          '**音色** 不填 `voice` 就用当前响着的嗓子；云端引擎要填它自己的 `voice_id`（清单在面板「引擎」页）。',
+          '**风格** `emotion` / `speed` / `vol` / `pitch` / `voiceModify` / `timbreWeights` 与 `speak` 的一次性参数同名同义，',
+          '但这里是"这一次成品"的参数（会跟着记录写进 `index.json`，方便回填）。当前引擎认识哪些看 `tts_state.engineHints`。',
+          '**长度** 上限由这家引擎决定（`tts_state` 不报，超了会返回错误并告诉你上限）；生成是整段合成，不受播报强度影响。',
+          '**生成模式**（`mode`）：不传 = `auto`（老行为：给了音色就用，`instructions` 有就发）。',
+          '`design` = 不要音色、让引擎按 `instructions` 现造一把嗓子（BreezeTTS 的 VOICE DESIGN，`seed` 决定抽到哪一把）；',
+          '`clone` = 用给定音色、**不发指令**（VOICE CLONE）；`direction` = 给定音色 + 指令（VOICE DIRECTION，必须给音色）。',
+          '当前引擎有没有这几种模式，看 `/engine` 快照的 `caps.modes`，别假设云端也认。',
+        ].join(''),
+        parameters: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: '要合成的声音文本（整段，不是播报片段）。可以写停顿记号，认不认识看 engineHints。' },
+            name: { type: 'string', description: '可选：文件名（不含扩展名）。非法字符会被清掉；撞名自动加 -1/-2，不覆盖已有文件。' },
+            save: { type: 'boolean', description: '**只有用户明确要求落盘时才传 true**（"存下来/导出/给我文件"）。不传 = 只试听：合成并播一遍，不写盘。' },
+            voice: { type: 'string', description: '可选：音色 id（云端要它自己的 voice_id）。不填用当前会话音色；`mode:"design"` 时一律不用音色。' },
+            mode: {
+              type: 'string',
+              enum: ['auto', 'design', 'clone', 'direction'],
+              description: '可选：生成模式。不传 = auto（老行为）。design=无音色、instructions 当音色描述；clone=有音色不带指令；direction=有音色+指令（必须有音色）。',
+            },
+            instructions: { type: 'string', description: '可选：语气/音色描述（breeze 的 instructions；云端多数没有这个字段，会被丢掉）。' },
+            emotion: { type: 'string', description: '可选：情绪档（只有当前引擎支持的才生效，见 tts_state.engineHints）。' },
+            speed: { type: 'number', description: '可选：语速 0.5~2（1=原速）。想要"慢"要动它。' },
+            vol: { type: 'number', description: '可选：音量 0.01~10。' },
+            pitch: { type: 'number', description: '可选：音调 -12~12。' },
+            voiceModify: {
+              type: 'object',
+              description: '可选：音色微调（pitch / intensity / timbre / soundEffects）。',
+              properties: {
+                pitch: { type: 'number' },
+                intensity: { type: 'number' },
+                timbre: { type: 'number' },
+                soundEffects: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+            timbreWeights: {
+              type: 'array',
+              description: '可选：多音色混音（至少 2 条，最多 4 条，权重 1~100）。',
+              items: {
+                type: 'object',
+                properties: {
+                  voice_id: { type: 'string' },
+                  weight: { type: 'number' },
+                },
+                required: ['voice_id'],
+                additionalProperties: false,
+              },
+            },
+            seed: { type: 'number', description: '可选：随机种子（设计音色时同描述+同种子=同一把嗓子）。默认 42。' },
+            seeds: {
+              type: 'array',
+              items: { type: 'number' },
+              description: '可选：**抽卡** —— 给 2~4 个不同的 seed，各生成一粒候选（必须同时 `save:true`）。'
+                + '每粒落成 `<名字>-s<种子>.wav`、**不自动播**，用户在面板「生成」页里点哪条播哪条。',
+            },
+            cfg_scale: { type: 'number', description: '可选：指令跟随强度（breeze 专用）。设计 4 / 指挥 2~3 / 克隆 1，>3 易刺耳。' },
+            temperature: { type: 'number', description: '可选：采样温度（breeze，0.01~3；0 或留空 = 模型默认）。' },
+            top_k: { type: 'number', description: '可选：top-k（breeze，1~300 整数；0 或留空 = 模型默认）。' },
+            top_p: { type: 'number', description: '可选：top-p（breeze，0.01~1；0 或留空 = 模型默认）。' },
+            repetition_penalty: { type: 'number', description: '可选：重复惩罚（breeze，0.5~2；0 或留空 = 模型默认）。' },
+            max_new_tokens: { type: 'number', description: '可选：单段帧上限（breeze，1~4000；12.5 帧≈1 秒，默认 750≈60 秒）。' },
+            split_chars: { type: 'number', description: '可选：长文本自动切分的粒度（breeze，1~4000，引擎默认 600；0 或留空 = 用服务器设置）。' },
+            session: { type: 'string', description: '可选：会话 id（决定播放归属的那一轮；一般不用填）。' },
+          },
+          required: ['text'],
+          additionalProperties: false,
+        },
+        output: {
+          schema: {
+            type: 'object',
+            properties: {
+              status: { type: 'string' },
+              mode: { type: 'string' },
+              file: { type: 'string' },
+              dir: { type: 'string' },
+              chars: { type: 'number' },
+              ms: { type: 'number' },
+              durationMs: { type: 'number' },
+              cached: { type: 'boolean' },
+              engine: { type: 'string' },
+              reason: { type: 'string' },
+              // B2：抽卡
+              take: { type: 'number' },
+              seeds: { type: 'array', items: { type: 'number' } },
+              files: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          render: (args, value) => {
+            const v = value || {};
+            const sec = v.durationMs ? `${(v.durationMs / 1000).toFixed(1)} 秒` : '';
+            if (v.status === 'error') return [{ type: 'text', text: `🧩 生成失败：${v.reason || '未知原因'}` }];
+            // B2：抽卡 —— 列出种子，告诉用户去面板里挑
+            if (Array.isArray(v.seeds) && v.seeds.length > 1) {
+              return [{
+                type: 'text',
+                text: `🎲 抽了 ${v.seeds.length} 粒（seed ${v.seeds.join(' / ')}）· 每粒都落了盘、都没播 ·`
+                  + ' 去面板「生成」页点哪条播哪条',
+              }];
+            }
+            if (v.mode === 'saved') {
+              return [{
+                type: 'text',
+                text: `💾 已存成 ${v.file}（${v.chars} 字${sec ? ` · ${sec}` : ''}）· 已播一遍 · 在面板「生成」页里能看到`,
+              }];
+            }
+            return [{
+              type: 'text',
+              text: `🎧 已生成并播了一遍（只试听，没有落盘${sec ? ` · ${sec}` : ''}）${args?.save === false ? '' : ' · 要存下来就说一声'}`,
+            }];
+          },
+        },
+        async execute(args, exec) {
+          const sessionId = exec?.agent?.id ? String(exec.agent.id) : String(args?.session || '');
+          const out = await runGenerate(args, {
+            sessionId,
+            // 硬规则：只有显式 `save:true` 才写盘（模型只在用户明确要求时传）
+            save: args?.save === true,
+            source: 'model',
+          });
+          if (!out.ok) return { status: 'error', reason: out.error, chars: 0 };
+          // B2：抽卡是一批，不是一条 —— 别硬塞进单条的字段里
+          if (Array.isArray(out.items)) {
+            return stripUndefined({
+              status: 'queued',
+              take: out.items.length,
+              seeds: out.items.map((one) => Number(one.seed) || 0),
+              files: out.items.map((one) => (one.item ? one.item.file : '')).filter(Boolean),
+              dir: out.dir,
+              chars: out.chars,
+              engine: out.engine,
+            });
+          }
+          return stripUndefined({
+            status: 'queued',
+            mode: out.mode,
+            file: out.item ? out.item.file : undefined,
+            dir: out.item ? out.dir : undefined,
+            chars: out.chars,
+            ms: out.ms,
+            durationMs: out.durationMs,
+            cached: out.cached || undefined,
+            engine: out.engine,
+          });
+        },
+      });
+      } catch (error) {
+        problems.push(`tool: start tts_generate failed: ${(error && error.message) || error}`);
+        note('tools:generate-fail', String((error && error.message) || error));
+      }
+
+      /*
+       * ───────── B3（1.0.0）：`tts_convert` —— VOICE CHANGER ─────────
+       *
+       * 为什么单独一个工具而不是给 `tts_generate` 加个 mode：参数集与返回形态都不一样
+       * （源是**音频**不是文本、结果是整段非流式、还要 KEEP MELODY），塞进去只会让两个
+       * 都不好用。契约在 `03` §2.9.10。
+       */
+      try {
+        ctx.tools.register({
+          name: 'tts_convert',
+          description: [
+            '把**一段已有的录音换成另一个人的声音**（BreezeTTS 的 VOICE CHANGER，本机引擎专有）。',
+            '与 `tts_generate` 的区别：那个是"给文本、造新语音"，这个是"给录音、保留内容与节奏、只换嗓子"。',
+            '**默认只试听、不落盘** 合成 + 播一遍；**只有用户明确要求"存下来/导出/给我文件"才传 `save:true`**（`10` §12）。',
+            '**源音频** `sourceName` = 生成列表里的文件名（最常用，免上传）；`source` = 本机 `.wav` 绝对路径。',
+            '**只收 wav**（mp3 等以后再说）。',
+            '**目标音色** `voice` 必填（声音库里的 id），不给会用当前会话音色。',
+            '**KEEP MELODY**（`keep_acoustic`）：`0` = 说话（默认，全部重新生成）；唱歌想留住旋律给 `1` 或 `2`；',
+            '**超过 2 会不稳、用在说话上反而起哄**（官方实测）。',
+            '**源稿**（`text`）：源录音的逐字稿，可选；**唱歌时强烈建议给** —— 不给稿，官方实测会把词听成别的。',
+            '**采样** `temperature 0.3 / top_k 1 / cfg_scale 1.0` 是转换专用默认（近乎贪心，开采样会让源音色漏回来），',
+            '与 `tts_generate` 的"0 = 模型默认"不是一回事。',
+            '**耗时** 转换是**非流式**的，引擎要先编码完整个源再开始，长素材很慢（141 秒素材约 137 秒）；',
+            '期间引擎被独占，播报会 409，`/state.converting` 为真。',
+          ].join(''),
+          parameters: {
+            type: 'object',
+            properties: {
+              sourceName: { type: 'string', description: '生成列表里的文件名（如 "开场白.wav"）。与 `source` 二选一，优先用它。' },
+              source: { type: 'string', description: '本机 .wav 绝对路径。与 `sourceName` 二选一。' },
+              voice: { type: 'string', description: '目标音色 id（声音库里的）。不给就用当前会话音色。' },
+              keep_acoustic: {
+                type: 'number',
+                description: 'KEEP MELODY：0=说话（默认）/ 1~2=唱歌保留旋律 / >2 不稳。',
+              },
+              text: { type: 'string', description: '源录音的逐字稿（可选，唱歌时强烈建议给）。' },
+              temperature: { type: 'number', description: '可选：转换用的深度采样温度，默认 0.3（别开太大，源音色会漏回来）。' },
+              top_k: { type: 'number', description: '可选：转换用的 top-k，默认 1。' },
+              cfg_scale: { type: 'number', description: '可选：往目标音色靠的引导强度，默认 1.0。' },
+              seed: { type: 'number', description: '可选：随机种子，默认 42。' },
+              name: { type: 'string', description: '可选：落盘文件名（不含扩展名），默认 `<源名>-变声`。' },
+              save: { type: 'boolean', description: '**只有用户明确要求落盘时才传 true**。不传 = 只试听、不写盘。' },
+            },
+            required: ['voice'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
+              type: 'object',
+              properties: {
+                status: { type: 'string' },
+                mode: { type: 'string' },
+                file: { type: 'string' },
+                dir: { type: 'string' },
+                durationMs: { type: 'number' },
+                ms: { type: 'number' },
+                cached: { type: 'boolean' },
+                engine: { type: 'string' },
+                keepAcoustic: { type: 'number' },
+                reason: { type: 'string' },
+              },
+            },
+            render: (args, value) => {
+              const v = value || {};
+              const sec = v.durationMs ? `${(v.durationMs / 1000).toFixed(1)} 秒` : '';
+              if (v.status === 'error') return [{ type: 'text', text: `🧩 变声失败：${v.reason || '未知原因'}` }];
+              if (v.mode === 'saved') {
+                return [{
+                  type: 'text',
+                  text: `🔁 已存成 ${v.file}（${sec || '时长未知'} · KEEP MELODY=${v.keepAcoustic ?? 0}）· 已播一遍 · 在面板「生成」页里能看到`,
+                }];
+              }
+              return [{
+                type: 'text',
+                text: `🔁 换声完成并播了一遍（只试听，没有落盘${sec ? ` · ${sec}` : ''}）· 要存下来就说一声`,
+              }];
+            },
+          },
+          async execute(args, exec) {
+            const sessionId = exec?.agent?.id ? String(exec.agent.id) : String(args?.session || '');
+            const out = await runConvert(args, {
+              sessionId,
+              // 硬规则：只有显式 `save:true` 才写盘
+              save: args?.save === true,
+              source: 'model',
+            });
+            if (!out.ok) return { status: 'error', reason: out.error, chars: 0 };
+            return stripUndefined({
+              status: 'queued',
+              mode: out.mode,
+              file: out.item ? out.item.file : undefined,
+              dir: out.item ? out.dir : undefined,
+              durationMs: out.durationMs,
+              ms: out.ms,
+              cached: out.cached || undefined,
+              engine: out.engine,
+              keepAcoustic: out.keepAcoustic,
+            });
+          },
+        });
+      } catch (error) {
+        problems.push(`tool: start tts_convert failed: ${(error && error.message) || error}`);
+        note('tools:convert-fail', String((error && error.message) || error));
+      }
+
       } catch (error) {
         problems.push(`tools fail: ${(error && error.message) || error}`);
         note('tools:fail', String((error && error.message) || error));
@@ -3827,6 +6373,36 @@ export function apply(ctx, config = {}) {
           const persona = cfg.fallback === 'roleplay' ? personaBlock() : '';
           const cast = cfg.fallback === 'roleplay' ? readCast() : [];
 
+          // P1：**引擎能力随引擎变，但这段提示词不分叉。**
+          // 这里只写一句永远成立的话：能写哪些记号去问 `tts_state.engineHints`。
+          // 反面做法（写死"你可以写 (laughs)"再按引擎换提示词）不成立 —— 提示词在会话内不刷新
+          // （`06` 坑 18 三次实测），切引擎后模型拿到的还是旧的那套，会继续写别家的记号。
+          const ENGINE_MARKER_RULE = [
+            '**引擎记号随引擎变化** `<#0.5#>` 停顿、`(laughs)` 这类括号语气词、情绪档，只有部分语音引擎认识。',
+            '**能写哪些，一律以 `tts_state` 返回的 `engineHints` 为准**——hints 里没提到的记号不要写。',
+            '写在别家引擎上会被照字念成"小于号井号零点五井号""括号 laughs 括号"这类噪音；插件虽然会在发出去前擦掉，但你想要的停顿和笑声也就没了。',
+            // P3：手册也是数据，不是提示词 —— 每轮读当前引擎那一份。
+            '**每个引擎的写法手册** `tts_state` 返回的 `enginePlaybook` 是**当前引擎**的官方写法要点（怎么断句、怎么用停顿与语气词、哪些记号会被擦、情绪怎么给）。**调 `speak` 前先按它组织语音文本**——同样的内容按手册写，出来的声音质量差很多。',
+            '手册里没提到的语法不要用；手册说的"别写"，就别写。切了引擎，手册会自动换一份，**不要沿用上一份的记忆**。',
+            // G0（0.96.0）：一次性风格参数 —— 同样是"标准"而不是"当前值"：这里只说**可以传**，
+            // 到底这家认不认识，仍然由 `engineHints` / `engineSupport` 现算。
+            '**这一次想换个语气，不用去改面板** `speak` 自带一次性风格参数 `emotion` / `speed` / `vol` / `pitch` / `voiceModify`——只作用于这一次合成，不写盘、下一轮自动回到面板的全局风格，所以放心按情景用。想说得"慢"要传 `speed`（`emotion` 改的是语调形态，不是时长）。',
+          ].join('\n');
+
+          /*
+           * G3：**"产出一段音频"和"念一句话"是两件事**，这里写死两者的边界。
+           *
+           * 用户定的落盘许可（`10` §12）：能力默认允许，但**只有用户明确要求时才写文件**。
+           * 这条规则不随模式变（四档都要一致），所以三种分支共用同一段文案 —— 与坑 27 的老道理一致：
+           * 提示词只放"标准与边界"，具体参数由 `tts_state.engineHints` 现算。
+           */
+          const GENERATE_RULE = [
+            '**要产出一段能保存的音频**（素材、台词样本、给别处用）→ 用 `tts_generate(text, …)`，别用 `speak`。',
+            '**落盘许可** `tts_generate` 不传 `save` 就只试听（合成 + 播一遍，不写文件、不进列表）；',
+            '**只有用户明确说了"存下来 / 导出 / 给我一个音频文件"才传 `save: true`**——别自作主张替用户存文件。',
+            '生成页（面板里）是用户自己动手的地方：你在那里生成的成品会带 `source:"model"` 进列表，供用户回填参数微调。',
+          ].join('\n');
+
           // 角色扮演：一套统一的优先级链，**不再按 cast 是否为空分叉**（历史提示词残留会导致自相矛盾）
           if (cfg.fallback === 'roleplay') {
             const lines = ['## 语音播报（角色扮演）', '本会话处于角色扮演模式，语音播报开启。'];
@@ -3838,6 +6414,8 @@ export function apply(ctx, config = {}) {
               '- `tts_card`：**当前**的角色卡与音色表（它们是文件，用户可能在会话中改过）；设定与说话人名字以它为准，别拿下文那份旧卡当现状。',
               '- **任何工具返回里出现 `cardDirty: true`**（`tts_state` / `speak` / `tts_card`）→ 角色卡或音色表刚被改过：**先调 `tts_card` 重读**，再按新设定演。',
             ].join('\n'));
+            lines.push(ENGINE_MARKER_RULE);
+            lines.push(GENERATE_RULE);
             if (cfg.narrationMode === 'script') {
               lines.push('**朗读方式：照本念** —— 插件按标记切分正文，**不会调用模型重写**。');
               lines.push([
@@ -3956,6 +6534,7 @@ export function apply(ctx, config = {}) {
               '**这一轮不要调用 `speak`** 正文本身就是播报内容。真调了也不会出声——这一档的 `speak` 会被忽略（返回 `skipped`），照样只念一遍正文。',
               '正文照常写给用户看：句子写完整、分段清楚就行；**不要**写「旁白：」「角色名：」这类标记（那是角色扮演的写法），也不要把路径、堆栈、表格塞进要念的句子里。',
               '代码、命令、表格照旧放在正文里——插件会自动跳过它们。',
+              GENERATE_RULE,
               '**若 `tts_state.fallback` 与这里写的不一致，以它为准**（设置可能在会话中途被改过；不一致时按它的档位行事）。',
             ].join('\n');
           }
@@ -3966,6 +6545,8 @@ export function apply(ctx, config = {}) {
             '本会话的语音播报处于开启状态。',
             '**若 `tts_state.fallback` 与这里写的不一致，以它为准**（设置可能在会话中途被改过）。',
             '**硬规则** 每一轮给出最终答复时，必须调用一次 `speak(text)`，没有例外（除非它返回 muted）。不要用“这轮只是回答问题／只是查资料／不算结论”说服自己跳过。',
+            ENGINE_MARKER_RULE,
+            GENERATE_RULE,
             // **AI 说档也不能写死"当前强度"**——和角色扮演档一样，提示词会陈旧（`10` §3.4 / Q24 / Q27 的同一原则）。
             // 这里只给三档标准表，当前档位一律指向 `tts_state` 与 `speak` 的返回。
             cfg.fallback === 'authored'
@@ -4012,7 +6593,9 @@ export function apply(ctx, config = {}) {
       } catch (error) {
         problems.push(`events fail approval/request: ${(error && error.message) || error}`);
       }
-      offEvents = ctx.on('session/event', onSessionEvent);
+      // `via` 是给"重复投递去重"用的：root 与每个 agent 各挂一份，两路都会投递，
+      // 不在 handler 里做幂等就会**每个事件处理两次**（表现：`events.log` 每行写两遍）。
+      offEvents = ctx.on('session/event', (session, event) => onSessionEvent(session, event, 'root'));
       problems.push('events ok: session/event');
       // 第二路触发：万一 session/event 不投递，turn-stopping 也能兜住（scheduled 去重）。
       // 必须延迟 350 ms：这一路比 turn/end 早约 2 ms 触发，而 provider/model 要等 turn/end
@@ -4041,7 +6624,7 @@ export function apply(ctx, config = {}) {
           const agent = payload?.agent;
           const id = agent?.id ? String(agent.id) : '';
           if (!id || !agent?.ctx) return;
-          const offSession = agent.ctx.on('session/event', onSessionEvent);
+          const offSession = agent.ctx.on('session/event', (session, event) => onSessionEvent(session, event, 'agent'));
           // `user-questions/request` 与 `approval/request` 是**按 agent 作用域派发**的 waterfall
           // （宿主源码 `ctx.waterfall(scopeTarget(agent, agent), …)`）。根上注册是否命中取决于 scope 标签，
           // 实测没响过，所以这里在同一 agent 的作用域上再挂一份——两边都挂，靠 remindSeen 去重。
@@ -4109,6 +6692,7 @@ export function apply(ctx, config = {}) {
         offSaveVoice?.();
         offState?.();
         offCard?.();
+        offGenerate?.();
         offRoute?.();
         offSection?.();
         offEvents?.();

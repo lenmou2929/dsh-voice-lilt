@@ -139,13 +139,27 @@ window.__ModuleLoader__.load({
     };
 
     /** 面板与 dock 共用的动作。全部走 store，因此两边永远看到同一份状态。 */
+    // 上一次报过的"没念成"时间戳，避免每 4 秒刷新都重弹同一句提示
+    let voiceFailureSeenAt = '';
     const api = {
       async refresh() {
         const query = store.sessionId ? `?session=${encodeURIComponent(store.sessionId)}` : '';
         const result = await getJson(`/voice-breeze/state${query}`);
         if (result.ok) {
           store.setState(result.data);
-          store.setDiag('');
+          // 宿主记下了"哪几句没念成"（超时丢弃 / 合成失败），这里把它摆到界面上。
+          // 以前这条信息只躺在 events.log 里，用户看到的是"已念"，然后以为模型没说话。
+          const failure = result.data && result.data.voiceFailure;
+          if (failure && failure.at) {
+            // 每 4 秒刷新都重设一次，别让提示一闪就没（`setDiag` 原来在成功分支里被无条件清空）
+            voiceFailureSeenAt = failure.at;
+            const why = String(failure.reason || '').replace(/^engine-timeout:\s*/, '').slice(0, 60);
+            store.setDiag(`⚠ ${failure.count || 1} 句没念成：${why}`);
+          } else if (voiceFailureSeenAt && String(store.diag || '').startsWith('⚠ ')) {
+            // 念成过了 → 撤掉这条提示（只撤我们自己写的，别踩别人的诊断行）
+            voiceFailureSeenAt = '';
+            store.setDiag('');
+          }
         } else {
           store.setDiag(`state ${result.status || 'ERR'}`);
         }
@@ -564,6 +578,203 @@ window.__ModuleLoader__.load({
     };
 
     /**
+     * （G2）：生成页的表单初值。
+     * 数值一律用字符串存（输入框的中间态就是字符串），提交前再由 `genStyleFromForm()` 洗成数字 ——
+     * 这样用户清空某项时不会被 `Number('')===0` 偷偷改成"0"。
+     */
+    /**
+     * 1.2.2：**音色清单的两种形状 → 一种**。
+     *
+     * 生成页的音色下拉需要 `{id, name}`，而它有两个来源、形状不同：
+     *  · `GET /engine` 的 `items` —— **`string[]`**（`voiceProfile().items`，只有 id）；
+     *  · `GET /voices`（本机引擎兜底）—— `{id, description}`。
+     * 以前只把后者映射了一遍，前者**原样塞进 `genVoices`** —— 于是 `one.id` 是 `undefined`，
+     * 三百多个 `<option>` 全是空白，用户看到的就是"一条都没有"（MiniMax 那次 327 条全隐形）。
+     * 现在统一走这一个函数：字符串 → `{id:n, name:n}`；对象 → 保 id、name 兜到 id。
+     */
+    const normVoiceList = (list) => (Array.isArray(list) ? list : [])
+      .map((one) => {
+        if (typeof one === 'string') return one.trim() ? { id: one.trim(), name: one.trim() } : null;
+        if (!one || typeof one !== 'object') return null;
+        const id = String(one.id || one.voice_id || '').trim();
+        if (!id) return null;
+        return { id, name: String(one.name || one.description || id).trim() || id };
+      })
+      .filter(Boolean);
+
+    const EMPTY_GEN_FORM = {
+      text: '',
+      name: '',
+      // B1（0.98.0）：生成模式。默认 `direction` —— 这正是 0.97.0 生成页的实际行为
+      // （音色兜会话音色、`instructions` 有就发），所以默认观感不变，只是现在说清楚了。
+      // `auto` 只留给工具不传 mode 的老调用方，不上界面。
+      mode: 'direction',
+      // B2（0.99.0）：采样参数。**空 = 引擎默认**（引擎的约定是 0 = 用模型默认，所以空不是 0）。
+      // `take` 是面板专属：≥2 就按 seed 递增生一串 → 一次抽 N 粒候选。
+      // B3（1.0.0）：变声档专用的三个字段 —— `srcName` = 生成列表里的文件名，
+      // `srcFile` = 浏览器选中的 File（上传走裸字节，不拼 FormData），`keep` = KEEP MELODY
+      srcName: '',
+      srcFile: null,
+      keep: '0',
+      seed: '',
+      take: '1',
+      // 引导强度（breeze 的 `cfg_scale`）：留空 = 按模式默认（设计 4 / 克隆 1 / 指挥 2.5）
+      cfg_scale: '',
+      temperature: '',
+      top_k: '',
+      top_p: '',
+      repetition_penalty: '',
+      max_new_tokens: '',
+      split_chars: '',
+      voice: '',
+      instructions: '',
+      emotion: '',
+      soundEffects: '',
+      speed: '',
+      vol: '',
+      pitch: '',
+      vmPitch: '',
+      vmIntensity: '',
+      vmTimbre: '',
+      // 多音色混音（`timbreWeights`）。至少两条才写进 style（少于两条在官方那里等于没混）。
+      mixes: [],
+    };
+
+    /**
+     * （G2）：把表单里填过的项拼成 `style` 对象（只带填了的字段）。
+     *
+     * 规则与宿主 `pickCallStyle()` 一致：空串 = 不传（用厂商/全局默认）；数字必须有限；
+     * 调音台三项在 0 时不写（0 在 MiniMax 里等于"不动"，写进去只会让请求多一个字段）。
+     * **这里是"少写"而不是"校验"** 越界由宿主 `coerceStyle()` 夹值，不在这边重复一套规则。
+     */
+    /**
+     * B2（0.99.0）：把「高级」区那几个格子转成请求字段。
+     * **空字符串一律不发** —— 引擎的约定是 `0` = 用模型默认，而空不是 0：
+     * 发了 `0` 与不发等价，但不发更诚实（日志里不会留下"看起来改了什么"的假象）。
+     */
+    /**
+     * B3：表单里的 `mode` 落到"这家真正支持的那几档"上。
+     * 渲染和提交必须用**同一个判断**，否则会出现"界面显示变声、实际提交 design"这类错位。
+     */
+    const genModeOf = (form, caps) => {
+      const list = Array.isArray(caps && caps.modes) && caps.modes.length ? caps.modes : ['clone'];
+      const want = String((form && form.mode) || 'direction');
+      return list.includes(want) ? want : list[list.length - 1];
+    };
+
+    const genSamplingFromForm = (form) => {
+      const out = {};
+      if (String(form.seed ?? '').trim() !== '') out.seed = Number(form.seed);
+      // `cfg_scale` 与那六项不归同一个函数（宿主用 `resolveGenMode()` 管它），但"表单 → 请求字段"
+      // 这一步只有这里，放一起最不容易漏。
+      if (String(form.cfg_scale ?? '').trim() !== '') out.cfg_scale = Number(form.cfg_scale);
+      for (const key of ['temperature', 'top_k', 'top_p', 'repetition_penalty', 'max_new_tokens', 'split_chars']) {
+        const raw = String(form[key] ?? '').trim();
+        if (raw !== '' && Number.isFinite(Number(raw))) out[key] = Number(raw);
+      }
+      return out;
+    };
+
+    const genStyleFromForm = (form) => {
+      const src = form && typeof form === 'object' ? form : {};
+      const style = {};
+      if (String(src.emotion || '').trim()) style.emotion = String(src.emotion).trim();
+      for (const key of ['speed', 'vol', 'pitch']) {
+        const raw = String(src[key] ?? '').trim();
+        if (raw !== '' && Number.isFinite(Number(raw))) style[key] = Number(raw);
+      }
+      const vm = {};
+      for (const [from, to] of [['vmPitch', 'pitch'], ['vmIntensity', 'intensity'], ['vmTimbre', 'timbre']]) {
+        const raw = String(src[from] ?? '').trim();
+        if (raw !== '' && Number.isFinite(Number(raw)) && Number(raw) !== 0) vm[to] = Number(raw);
+      }
+      if (String(src.soundEffects || '').trim()) vm.soundEffects = String(src.soundEffects).trim();
+      if (Object.keys(vm).length) style.voiceModify = vm;
+      // 混音：最多 4 条、权重 1~100；少于两条不写（官方规则，见 `03` §2.9.4 ③）
+      const mixes = Array.isArray(src.mixes) ? src.mixes : [];
+      const weights = mixes
+        .map((one) => ({
+          voice_id: String((one && one.voice_id) || '').trim(),
+          weight: Math.round(Number(one && one.weight) || 0),
+        }))
+        .filter((one) => one.voice_id && one.weight > 0)
+        .slice(0, 4);
+      if (weights.length >= 2) style.timbreWeights = weights;
+      return style;
+    };
+
+    /**
+     * G4b（1.0.8）：**一条 index 记录 → 一份表单**。
+     *
+     * 以前这段逻辑只长在"模型刚生成过就自动回填"的 `useEffect` 里（G3），
+     * 于是「按这条参数再生成」这个按钮要重写一遍同样的映射 —— 两份必然漂。
+     * 现在收成这一个纯函数（`function` 声明，提升，不存在 TDZ 问题）：
+     * 自动回填、列表里每条上的「拿来再生成」，都调它。
+     *
+     * 两条容易漏的：
+     *  ① 采样六项必须一起回填 —— 它们 1.0.8 才进 index（`generatedEntry` 白名单），
+     *     老记录里是 `null`，`num()` 会落成空串（= 引擎默认），比填 0 正确（坑 42）。
+     *  ② 变声记录（`genMode:'changer'`）要回填**源与 KEEP MELODY**，否则用户点进来
+     *     看到的是一个空的"源音频"格，还得自己去列表里猜刚才用的是哪条。
+     */
+    function formFromEntry(entry) {
+      const one = entry && typeof entry === 'object' ? entry : {};
+      const st = one.style && typeof one.style === 'object' ? one.style : {};
+      const vm = st.voiceModify && typeof st.voiceModify === 'object' ? st.voiceModify : {};
+      const num = (value) => (value === undefined || value === null ? '' : String(value));
+      const isChanger = String(one.genMode || '') === 'changer';
+      return {
+        ...EMPTY_GEN_FORM,
+        text: String(one.text || ''),
+        name: '',
+        mode: String(one.genMode || one.mode || 'direction'),
+        seed: num(one.seed),
+        cfg_scale: num(one.cfgScale),
+        temperature: num(one.temperature),
+        top_k: num(one.top_k),
+        top_p: num(one.top_p),
+        repetition_penalty: num(one.repetition_penalty),
+        max_new_tokens: num(one.max_new_tokens),
+        split_chars: num(one.split_chars),
+        voice: String(one.voice || ''),
+        instructions: String(one.instructions || ''),
+        emotion: String(st.emotion || ''),
+        soundEffects: String(vm.soundEffects || ''),
+        speed: num(st.speed),
+        vol: num(st.vol),
+        pitch: num(st.pitch),
+        vmPitch: num(vm.pitch),
+        vmIntensity: num(vm.intensity),
+        vmTimbre: num(vm.timbre),
+        mixes: Array.isArray(st.timbreWeights)
+          ? st.timbreWeights.map((m) => ({ voice_id: String(m.voice_id || ''), weight: m.weight }))
+          : [],
+        // 变声档专用：源文件（`fromFile` 是 1.0.8 才记的，老记录没有 → 空，让用户重选）
+        srcName: isChanger ? String(one.fromFile || '') : '',
+        srcFile: null,
+        keep: isChanger ? num(one.keepAcoustic) || '0' : '0',
+      };
+    }
+
+    /** 文件大小 → 好读的字符串（列表里显示用） */
+    const prettyBytes = (n) => {
+      const v = Number(n) || 0;
+      if (v >= 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+      if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+      return `${v} B`;
+    };
+
+    /** 时长 → `m:ss` / `ss.s 秒` */
+    const prettyDuration = (ms) => {
+      const total = Math.max(0, Math.round(Number(ms) || 0));
+      if (!total) return '';
+      if (total < 60000) return `${(total / 1000).toFixed(1)} 秒`;
+      const m = Math.floor(total / 60000);
+      const s = Math.round((total % 60000) / 1000);
+      return `${m} 分 ${s} 秒`;
+    };
+
+    /**
      *  F7d：音色表的「表格式」视图。
      * 面板里不让人手写 JSON：把 cast.json 解析成行，改完再序列化回去。
      * 两种输入都认（`{characters:[…]}` 与裸数组），跟宿主的 readCast() 一致。
@@ -621,6 +832,22 @@ window.__ModuleLoader__.load({
       fontSize: 12,
       lineHeight: '18px',
       fontFamily: 'inherit',
+    };
+
+    /**
+     * **客户端时间线**。只为查"同一段音频被拉了两遍"那类问题——
+     * 浏览器侧的 `loadstart` 次数是唯一能分辨"两个元素"还是"同一个元素被重拉"的证据，
+     * 而它只活在浏览器里，不回传就永远看不见。一行一条、每播放一段最多 4 行。
+     */
+    let clientTraceSeq = 0;
+    const clog = (msg) => {
+      try {
+        void fetch('/voice-breeze/client-log', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ msg: String(msg).slice(0, 200) }),
+        }).catch(() => {});
+      } catch { /* 诊断不该影响播放 */ }
     };
 
     const getJson = async (url, init) => {
@@ -726,6 +953,50 @@ window.__ModuleLoader__.load({
         setNow(item.text || '');
         const el = new Audio(item.url);
         el.preload = 'auto';
+        // 时间线。`loadstart` 是浏览器"真的去拉这个 URL"的那一刻——
+        // 同一个元素上出现两次 = 浏览器自己重拉；出现两个元素序号 = 队列里有两份。
+        const traceNo = (clientTraceSeq += 1);
+        const shortId = String(item.id || el.src.split('/').pop() || '').slice(0, 16);
+        let how = 'ended';
+        clog(`play#${traceNo} id=${shortId} chars=${item.chars || 0}`);
+        el.addEventListener('loadstart', () => clog(`loadstart#${traceNo} id=${shortId}`));
+        /*
+         * 2026-11-18：**播放器这一侧到底发生了什么**。
+         *
+         * 只记 `play/loadstart/end` 是不够的 —— 用户报"读到一半刺啦"，而日志里只有一条 `end`。
+         * 现在把媒体元素的每个状态转折都记下来（带 `currentTime` 与已缓冲到的秒数）：
+         *  · `loadedmetadata` / `duration` → 浏览器认为这条音频多长（和盘上字节对不上就是容器问题）；
+         *  · `waiting` / `stalled` → 断供（这就是"刺啦 + 变长"的那一段）；
+         *  · `suspend` / `abort` / `emptied` → 媒体栈自己重置了资源（与宿主 `audio:abort` 对照看）；
+         *  · `error` → 解码失败的 code（MEDIA_ERR_DECODE = 3 就是"读不懂这段数据"）；
+         *  · `seeked` → 有人跳读了。
+         * 这些行只在播放期出现，量很小；排查时是唯一能说明"用户当时听到了什么"的证据。
+         */
+        const at = () => {
+          try {
+            const b = el.buffered;
+            const bufferedTo = b && b.length ? b.end(b.length - 1) : 0;
+            return `t=${Number(el.currentTime || 0).toFixed(2)} dur=${Number.isFinite(el.duration) ? Number(el.duration).toFixed(2) : '?'} buf=${Number(bufferedTo || 0).toFixed(2)}`;
+          } catch { return 't=?'; }
+        };
+        for (const [evt, label] of [
+          ['loadedmetadata', 'meta'],
+          ['canplay', 'canplay'],
+          ['playing', 'playing'],
+          ['waiting', 'waiting'],
+          ['stalled', 'stalled'],
+          ['suspend', 'suspend'],
+          ['abort', 'abort'],
+          ['emptied', 'emptied'],
+          ['seeked', 'seeked'],
+        ]) {
+          el.addEventListener(evt, () => clog(`${label}#${traceNo} id=${shortId} ${at()}`));
+        }
+        el.addEventListener('error', () => {
+          const code = el.error ? el.error.code : '?';
+          const msg = el.error && el.error.message ? String(el.error.message).slice(0, 60) : '';
+          clog(`mediaerror#${traceNo} id=${shortId} code=${code} ${msg} ${at()}`);
+        });
         // 音量取**模块级 store 的当前值**，不取这次渲染的快照。
         // 轮询那条路每次都调最新的 pump（`pumpRef.current = pump`），所以一直是对的；
         // 重播走的是 `bus.attach` 时注册的那一份 `runGroup → playOne` 闭包（依赖没变就不会重建），
@@ -752,9 +1023,27 @@ window.__ModuleLoader__.load({
         }
         await new Promise((resolve) => {
           el.onended = resolve;
-          el.onerror = resolve;
-          el.onpause = () => { if (stopFlag.current) resolve(); };
+          el.onerror = () => {
+            // **合成失败不再是静音的黑洞**。以前这一段被 'error' 直接当"播完了"，
+            // 界面上只留一句"已念"（朋友的现场就是这么被骗了三小时）。现在至少留一句话 + 日志。
+            how = 'error';
+            const raw = el.error ? el.error.code : 0;
+            const code = el.error ? `media ${el.error.code}` : 'unknown';
+            clog(`error#${traceNo} id=${shortId} ${code}`);
+            /*
+             * 1.2.4：**别把所有播放失败都说成"没合成成功"**。
+             * `code 4`（DEMUXER_ERROR_COULD_NOT_OPEN）几乎总是"这个 id 服务器上已经没有"
+             * （账目过期 / 服务重启过）—— 那时"点重播再试一次"还是同一个 id，照样失败，
+             * 等于让用户白点。`code 3`（DECODE）才是数据本身坏。
+             */
+            setDiag(raw === 4
+              ? '🔇 这段语音已经不在了（账目过期或服务重启过）· 去「生成」页或历史里再听一次'
+              : `🔇 这段没合成成功（${code}）· 点重播再试一次`);
+            resolve();
+          };
+          el.onpause = () => { if (stopFlag.current) { how = 'paused'; resolve(); } };
         });
+        clog(`end#${traceNo} id=${shortId} ${how}`);
         if (audio.current === el) audio.current = null;
         setNow('');
         return true;
@@ -793,11 +1082,21 @@ window.__ModuleLoader__.load({
           return;
         }
         if (!alive.current) return;
-        // 多段播报之间留气口：队列里还有下一段时，先静默 gapMs 再念
+        /*
+         * 多段播报之间留气口：队列里还有下一段时，先静默 gapMs 再念。
+         *
+         * T5：**同一段的续片不插气口**。宿主把一段长文本切成几片
+         * （`pieceGroup` 相同），那几片本来就是一句话的不同部分 —— 每片之间插 500 ms
+         * 会把"抗卡顿"变成"一句一顿"，比原来的卡顿更难听。所以只在"换段"时留气口。
+         */
         if (queue.current.length) {
-          const gap = Number(state.segmentGapMs);
-          await new Promise((resolve) => setTimeout(resolve, Number.isFinite(gap) && gap >= 0 ? gap : 1200));
-          if (!alive.current) return;
+          const next = queue.current[0];
+          const sameGroup = Boolean(item.pieceGroup) && next && next.pieceGroup === item.pieceGroup;
+          const gap = sameGroup ? 0 : Number(state.segmentGapMs);
+          if (gap > 0) {
+            await new Promise((resolve) => setTimeout(resolve, Number.isFinite(gap) && gap >= 0 ? gap : 1200));
+            if (!alive.current) return;
+          }
         }
         void pump();
       }
@@ -955,20 +1254,24 @@ window.__ModuleLoader__.load({
        * 优先问 Host 要本会话的全部账目（带 turn 分组），拿不到再退回本地记住的那条。
        */
       const replay = useCallback(async () => {
-        let items = [];
+        /*
+         * 1.2.4：**问宿主要"最新一轮播报"，不再自己从账目里猜**。
+         *
+         * 老写法取 `/pending?since=0` 的**最后一条**，再按它的 `turn` 分组。
+         * 可账目里还混着面板生成的音频（`kind:'gen'`，`turn` 常常是 0 —— 它不属于任何回合），
+         * 于是"重播最新一轮"变成"把 turn=0 的全部音频从头放一遍"：
+         * 用户听到的是自己生成过的十几条依次播，最后还因为某条已被淘汰而 404 报红。
+         */
+        let group = [];
         if (sessionId) {
-          const result = await getJson(`/voice-breeze/pending?session=${encodeURIComponent(sessionId)}&since=0`);
-          if (result.ok && Array.isArray(result.data && result.data.items)) items = result.data.items;
+          const result = await getJson(`/voice-breeze/replay?session=${encodeURIComponent(sessionId)}`);
+          if (result.ok && Array.isArray(result.data && result.data.items)) group = result.data.items;
         }
-        if (!items.length && lastItem.current && lastItem.current.url) items = [lastItem.current];
-        if (!items.length) {
+        if (!group.length && lastItem.current && lastItem.current.url) group = [lastItem.current];
+        if (!group.length) {
           setDiag('没有可重播的语音');
           return;
         }
-        const latest = items[items.length - 1];
-        const group = latest && latest.turn !== undefined
-          ? items.filter((item) => item.turn === latest.turn)
-          : [latest];
         await runGroup(group, '');
       }, [sessionId, runGroup]);
 
@@ -1122,12 +1425,22 @@ window.__ModuleLoader__.load({
       const current = state.voice || '';
       const multiVoice = Boolean(state.multiVoice);
       const sceneInfo = state.scene || { active: '_default', ids: [] };
+      // /（A3）：**音色下拉跟当前引擎走**。云端引擎的音色在面板「引擎」页选，
+      // 这个下拉列的是本机 BreezeTTS 声音库，对云端毫无意义（发过去只会 400 或被静默换嗓子），
+      // 所以云端下不列本机音色，改成一句指路（`15` §4.9）。
+      const eng = state.engine || null;
+      const notBreeze = Boolean(eng && eng.kind && eng.kind !== 'breeze');
       let options;
       if (multiVoice) {
         // 多音色模式：同一个下拉变形为「场景选择器」
         options = [
           ...sceneInfo.ids.map((id) => ({ id: `scene:${id}`, label: id === sceneInfo.active ? `🎭 ${id} · 当前` : `🎭 ${id}` })),
           { id: 'exit-multivoice', label: '↩ 退出多音色（回到单音色）' },
+        ];
+      } else if (notBreeze) {
+        options = [
+          { id: 'enter-multivoice', label: `🎭 多音色扮演${sceneInfo.ids.length ? `（${sceneInfo.active} · ${state.castSize || 0} 个音色）` : '（本场景没有音色表）'}` },
+          { id: '', label: `（音色在面板「引擎」页里选：${eng.label || eng.id}）`, disabled: true },
         ];
       } else {
         // 去掉下拉里的「设计音色」（听感差、出过大妈音；要设计音色直接对话里说）。
@@ -1145,12 +1458,16 @@ window.__ModuleLoader__.load({
       children.push(h('select', {
         key: 'voice',
         style: selStyle,
-        value: multiVoice ? `scene:${sceneInfo.active}` : current,
+        value: multiVoice ? `scene:${sceneInfo.active}` : (notBreeze ? '' : current),
         title: multiVoice
           ? '选场景：连同这一局的角色卡与音色表一起换'
-          : '选音色；第一项「多音色扮演」进入分角色演出',
-        onFocus: () => { void api.loadVoices(); },
-        onChange: (event) => { void api.pickVoice(event.target.value); },
+          : (notBreeze ? '云端引擎的音色在面板「引擎」页里选' : '选音色；第一项「多音色扮演」进入分角色演出'),
+        onFocus: () => { if (!notBreeze) void api.loadVoices(); },
+        onChange: (event) => {
+          const next = event.target.value;
+          if (notBreeze && !next) return; // 说明项不是可选项
+          void api.pickVoice(next);
+        },
       }, options.map((o) => h('option', { key: o.id || 'design', value: o.id, disabled: Boolean(o.disabled) }, o.label))));
 
       return h('span', {
@@ -1164,6 +1481,19 @@ window.__ModuleLoader__.load({
     }
 
     const PANEL_W = 380;
+    /**
+     * **顶栏保护线**。
+     *
+     * 实测：把浮窗拖到左上角（`y=0`）之后，想再拖回来时点不到它——
+     * 那一条是 DSH 的窗口顶栏，点下去是"拖整个窗口 / 点顶栏按钮"。
+     * 两层修法一起上：
+     *  1. 面板层级提到 `Z_PANEL`（夹在 DSH 自己的浮层之间，见那里的注释）；
+     *  2. **位置夹住** `y` 不允许小于这条线，旧坐标（`y=0`）在打开时就被抬回来 ——
+     *     这样即使层级判断有误，面板也不会再落到顶栏里变成"够不着"。
+     */
+    const TITLEBAR_GUARD = 48;
+    /** DSH 自己的浮层：菜单/悬停卡 100、子菜单 101、模态 1000、toast 1100（从它的 CSS 里数的）。 */
+    const Z_PANEL = 300;
 
     function panelDefaultPos() {
       const viewW = typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 1280;
@@ -1174,13 +1504,14 @@ window.__ModuleLoader__.load({
      * 把面板位置夹进视口。
      * 修：最大化时把面板拖到最右，再把窗口恢复成小窗 → `position: fixed` 的坐标没变，
      * 面板就跑到缩小后的窗口外面（看不见）；重新最大化又"回来"了。窗口 resize 时一律夹回。
+     * 上边界从 0 提到 `TITLEBAR_GUARD`（顶栏那一条不归我们管）。
      */
     function clampPos(x, y) {
       const viewW = typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 1280;
       const viewH = typeof window !== 'undefined' && window.innerHeight ? window.innerHeight : 800;
       return {
         x: Math.max(0, Math.min(Number(x) || 0, Math.max(0, viewW - PANEL_W - 8))),
-        y: Math.max(0, Math.min(Number(y) || 0, Math.max(0, viewH - 80))),
+        y: Math.max(TITLEBAR_GUARD, Math.min(Number(y) || 0, Math.max(TITLEBAR_GUARD, viewH - 80))),
       };
     }
 
@@ -1256,6 +1587,17 @@ window.__ModuleLoader__.load({
         }, 200);
       };
       /** 松手 / 键盘调整 / 失焦：立刻落盘，不等那 200 ms。 */
+      /*
+       * T5（1.2.0）：片长的草稿值。`null` = 没在改（显示宿主的值），改完 blur/回车才落盘。
+       */
+      const [chunkDraft, setChunkDraft] = useState(null);
+      const commitChunk = () => {
+        if (chunkDraft === null) return;
+        const raw = String(chunkDraft).trim();
+        const next = raw === '' ? 0 : Math.min(400, Math.max(0, Math.round(Number(raw) || 0)));
+        setChunkDraft(null);
+        void patchState({ chunkChars: next }, '切片片长');
+      };
       const commitVolume = () => {
         if (volTimer.current) { clearTimeout(volTimer.current); volTimer.current = null; }
         if (volDraft === null) return;
@@ -1432,6 +1774,439 @@ window.__ModuleLoader__.load({
       }, []);
 
       installTip();
+      // ───────── （A3）：引擎页 ─────────
+      // 设计口径（`15` §4.7 / §4.9）：本机引擎永远在列表里且不可删；云端 provider 可新建/编辑/启用/删除；
+      // key 只写不读（保存后输入框清空，快照里只有 keyPresent）；**没有音色清单的引擎把音色控件藏起来，并把
+      // 「现在用谁 / 为什么藏了 / 想换怎么办」用宿主给的 guidance 原话讲清楚**。
+      const [engInfo, setEngInfo] = useState(null);
+      const [engForm, setEngForm] = useState(null); // { id, label, baseUrl, model, apiKey, defaultVoice, isNew }
+      const [engMsg, setEngMsg] = useState('');
+      const [engBusy, setEngBusy] = useState(false);
+      // 音色清单（`{id,name}`）。编辑时先用该 provider 快照里的 items 铺底，
+      // 「拉取清单」再去问引擎要真的（MiniMax 有 `/v1/get_voice`）。
+      const [voiceList, setVoiceList] = useState([]);
+
+      const loadEngine = useCallback(async () => {
+        const result = await getJson('/voice-breeze/engine');
+        if (result.ok) setEngInfo(result.data);
+        else setEngMsg(`读取失败：${result.status || ''}`);
+      }, []);
+
+      // 只在切到引擎页时拉一次（面板每帧都渲染，不能无条件请求）
+      useEffect(() => {
+        if (tab === 'engine') void loadEngine();
+      }, [tab, loadEngine]);
+
+      const enginePost = useCallback(async (payload) => {
+        setEngBusy(true);
+        const result = await getJson('/voice-breeze/engine', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        setEngBusy(false);
+        if (result.ok) {
+          setEngInfo(result.data);
+          setEngMsg('');
+        } else {
+          setEngMsg(`操作失败：${(result.data && result.data.error) || result.status || ''}`);
+        }
+        return result;
+      }, []);
+
+      /** 保存一条 provider：POST 是**整组替换**，所以要把现有列表整份带上。 */
+      const submitEngine = useCallback(async (form) => {
+        const id = String(form.id || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,32}$/.test(id) || id === 'breeze') {
+          setEngMsg('id 只能用字母 / 数字 / - / _（1~32 位），且不能叫 breeze');
+          return null;
+        }
+        const baseUrl = String(form.baseUrl || '').trim();
+        if (!/^https?:\/\//i.test(baseUrl)) {
+          setEngMsg('baseUrl 要以 http:// 或 https:// 开头');
+          return null;
+        }
+        const list = (((engInfo && engInfo.providers) || [])).map((one) => ({ ...one }));
+        // 按域名猜厂商专用 kind —— MiniMax 不走 OpenAI 兼容形状，
+        // 存成 openai-compat 会把请求打到 /v1/audio/speech 拿 404。
+        let guessHost = '';
+        try { guessHost = new URL(baseUrl).hostname.toLowerCase(); } catch { guessHost = ''; }
+        const guessedKind = (guessHost.includes('minimax') || guessHost.includes('minimaxi')) ? 'minimax' : 'openai-compat';
+        const entry = {
+          id,
+          kind: guessedKind,
+          label: String(form.label || id).trim(),
+          baseUrl,
+          model: String(form.model || 'tts-1').trim(),
+          defaultVoice: String(form.defaultVoice || '').trim(),
+        };
+        // （P2）：风格参数原样交给宿主洗（白名单 + 夹值都在 `coerceStyle()` 里）。
+        // 非 MiniMax 的表单没有这一块，就不带 style —— 免得把已有的风格整组洗掉。
+        if (form.style && typeof form.style === 'object') entry.style = form.style;
+        if (form.apiKey && String(form.apiKey).trim()) entry.apiKey = String(form.apiKey).trim();
+        const at = list.findIndex((one) => one.id === id);
+        if (at >= 0) list[at] = { ...list[at], ...entry };
+        else list.push(entry);
+        const result = await enginePost({ providers: list });
+        if (result && result.ok) setEngForm(null);
+        return result;
+      }, [engInfo, enginePost]);
+
+      const removeEngine = useCallback(async (id) => {
+        const list = (((engInfo && engInfo.providers) || []).filter((one) => one.id !== id)).map((one) => ({ ...one }));
+        await enginePost({ providers: list });
+      }, [engInfo, enginePost]);
+
+      // ───────── （G2）：生成页 ─────────
+      // 全部 hooks 必须写在这句 `return null` **之前**（`06` 坑 20：早退之后的 hook 会让组件直接抛错）。
+      const [genInfo, setGenInfo] = useState(null);   // {dir, items, last}
+      const [genCaps, setGenCaps] = useState(null);   // /engine 的 caps —— 与「引擎」页同源，不按域名猜
+      const [genVoices, setGenVoices] = useState([]); // 当前引擎的音色清单（面板里只做候选，可自由填）
+      const [genDir, setGenDir] = useState('');       // 输出目录（输入框里的值）
+      const [genForm, setGenForm] = useState(EMPTY_GEN_FORM);
+      const [genMsg, setGenMsg] = useState('');
+      const [genBusy, setGenBusy] = useState(false);
+      // 2026-11-18 用户定：**采样六格默认折叠**（常用的是种子/抽卡，那几项是偶尔才动的旋钮）。
+      const [genAdv, setGenAdv] = useState(false);
+      /*
+       * 2026-11-18：手动「启动引擎」按钮的"刚点过"记忆。
+       * 20 秒内不再发请求（宿主那边也有 `serverStarting` 闸门 + spawn 节流，双保险）；
+       * 引擎起来后整张卡片会消失，所以不需要额外的"重置"逻辑。
+       */
+      const [engineStartedAt, setEngineStartedAt] = useState(0);
+      /*
+       * 提交锁：`disabled` 要等下一次渲染才生效，同一帧里的第二次点击照样会进来；
+       * 结果是"第一次成功、第二次失败"，失败提示盖掉成功提示 —— 用户看到"明明播了却说失败"。
+       * `useRef` 是同步的，挡得住这一帧。
+       */
+      const submitLock = useRef(false);
+      const [genRename, setGenRename] = useState({ from: '', to: '' });
+      const [genDel, setGenDel] = useState('');       // 删除二次确认（点一下变「确认删除?」）
+      const [genFilledAt, setGenFilledAt] = useState(''); // 已经回填过哪一条（按 `at` 去重，避免每帧重填）
+      /*
+       * G4（1.0.8）：批量生成与拖拽排序。
+       *
+       * `genBatch` 是那行"一行一条"的原文（**与表单的 `text` 分开** 批量的输入不该把单条正文顶掉）；
+       * `genBatchOpen` 默认收起 —— 批量是偶发操作，摊开会让表单长一截。
+       * `genDrag` 记"正在拖哪一条"，只用于给被拖的那行加虚线框（视觉反馈，不参与数据）。
+       */
+      const [genBatch, setGenBatch] = useState('');
+      const [genBatchOpen, setGenBatchOpen] = useState(false);
+      const [genDrag, setGenDrag] = useState('');
+      // G5（1.0.9）：垃圾桶「清空」的二次确认（与音频删除同一套手感，4 秒自己取消）
+      const [genTrashDel, setGenTrashDel] = useState(false);
+
+      const loadGen = useCallback(async () => {
+        const [list, eng] = await Promise.all([getJson('/voice-breeze/gen'), getJson('/voice-breeze/engine')]);
+        if (list.ok) {
+          setGenInfo(list.data);
+          setGenDir(String((list.data && list.data.dir) || ''));
+        } else {
+          setGenMsg(`读取生成目录失败：${list.status || ''}`);
+        }
+        if (eng.ok) {
+          const caps = (eng.data && eng.data.caps) || null;
+          setGenCaps(caps);
+          // 1.2.2：`/engine.items` 是 `string[]`，**必须归一化**（否则下拉里全是空白项）
+          const items = normVoiceList(eng.data && eng.data.items);
+          setGenVoices(items);
+          // 本机引擎的音色清单是**异步拉的**（`/v1/voices` 缓存 60 s）：刚启动时 `/engine.items` 可能是空的，
+          // 于是生成页会退化成"手填音色 id"。这里补一次 `/voices`，本机用户就能直接选。
+          if (!items.length && (!caps || caps.kind === 'breeze')) {
+            const list = await getJson('/voice-breeze/voices');
+            if (list.ok && Array.isArray(list.data && list.data.items)) {
+              setGenVoices(normVoiceList(list.data.items));
+            }
+          }
+        }
+      }, []);
+
+      useEffect(() => {
+        if (tab === 'gen') void loadGen();
+      }, [tab, loadGen]);
+
+      /*
+       * G3 的回填（`10` §12）：面板打开「生成」页时，若**最后一条来自模型**，
+       * 把它那次用的整套参数填进表单，用户在模型给的基础上微调再生成 —— 这就是要的闭环。
+       * 只在 `last.at` 变了时填一次：用户改到一半顺手刷新列表，不该把他的手改冲掉。
+       */
+      useEffect(() => {
+        if (tab !== 'gen' || !genInfo || !genInfo.last) return;
+        const last = genInfo.last;
+        if (last.source !== 'model') return;
+        const key = String(last.at || last.file || '');
+        if (!key || key === genFilledAt) return;
+        setGenFilledAt(key);
+        // G4b：映射收进 `formFromEntry()`（与列表里那个「拿来再生成」按钮共用一份）
+        setGenForm(formFromEntry(last));
+        setGenMsg(`模型刚生成过一条（${last.file}），参数已填进表单，改完可以直接再生成`);
+      }, [tab, genInfo, genFilledAt]);
+
+      // 删除的二次确认：4 秒没人点就自己取消（与场景删除同一套手感）
+      useEffect(() => {
+        if (!genDel) return undefined;
+        const timer = setTimeout(() => setGenDel(''), 4000);
+        return () => clearTimeout(timer);
+      }, [genDel]);
+
+      // G5：「清空垃圾桶」的二次确认同样 4 秒过期（避免"确认"按钮一直挂着被误点）
+      useEffect(() => {
+        if (!genTrashDel) return undefined;
+        const timer = setTimeout(() => setGenTrashDel(false), 4000);
+        return () => clearTimeout(timer);
+      }, [genTrashDel]);
+
+      /**
+       * B3（1.0.0）：变声提交。**两条投递方式**（与宿主 `/convert` 的两种 content-type 一一对应）：
+       *
+       *  · 从生成列表挑一条 → JSON `{sourceName, voice, keep_acoustic, …}`；
+       *    源就在宿主的输出目录里，一个字节都不用上传。
+       *  · 浏览器选了文件 → **body 直接是 wav 字节**、参数全在 query 上；
+       *    宿主那边一行 multipart 解析都不用写（它连 form 都不建）。
+       *
+       * 变声是**非流式**的：引擎要先编码完整个源才出声，长素材很慢，所以这里只给一句等待提示。
+       */
+      const submitConvert = useCallback(async (form) => {
+        const voice = String(form.voice || '').trim();
+        if (!voice) { setGenMsg('先选一个目标音色'); return; }
+        const hasFile = Boolean(form.srcFile);
+        if (!hasFile && !String(form.srcName || '').trim()) {
+          setGenMsg('先选一段源音频：列表里挑一条，或上传一个 wav');
+          return;
+        }
+        setGenBusy(true);
+        setGenMsg(hasFile ? '正在上传并换声…（引擎要先编码整段源，长素材会很久）' : '正在换声…（引擎要先编码整段源，长素材会很久）');
+        const q = new URLSearchParams();
+        q.set('voice', voice);
+        q.set('keep', String(form.keep || '0'));
+        for (const key of ['temperature', 'top_k', 'cfg_scale', 'seed']) {
+          const raw = String(form[key] ?? '').trim();
+          if (raw !== '') q.set(key, raw);
+        }
+        const srcText = String(form.text || '').trim();
+        if (srcText) q.set('text', srcText);
+        const wanted = String(form.name || '').trim();
+        if (wanted) q.set('name', wanted);
+        if (store.sessionId) q.set('session', store.sessionId);
+
+        /*
+         * ⚠ 2026-11-18：`await` 必须包住**整个三元**。
+         * 原来写的是 `const result = hasFile ? await (async …)() : getJson(…)` ——
+         * `await` 只绑定了 `hasFile` 为真的那一支；**从列表里挑源**（`hasFile === false`）时
+         * `result` 拿到的是一个 **Promise**，于是 `!result.ok` 恒为真（`Promise.ok` 是 undefined），
+         * 面板就报「换声失败：」（`data`/`status` 都没有，所以后半句还是空的）——
+         * 而宿主那边**成功并播了**，日志里只有 `convert:done`。
+         * `node --check` 查不出来（语法完全合法）。
+         */
+        const result = await (hasFile
+          ? (async () => {
+            q.set('filename', String(form.srcFile.name || 'upload.wav'));
+            return getJson(`/voice-breeze/convert?${q.toString()}`, {
+              method: 'POST',
+              headers: { 'content-type': form.srcFile.type || 'audio/wav' },
+              body: form.srcFile,
+            });
+          })()
+          : getJson('/voice-breeze/convert', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              sourceName: String(form.srcName || '').trim(),
+              voice,
+              keep_acoustic: Number(form.keep || 0),
+              temperature: String(form.temperature || '').trim() || undefined,
+              top_k: String(form.top_k || '').trim() || undefined,
+              cfg_scale: String(form.cfg_scale || '').trim() || undefined,
+              seed: String(form.seed || '').trim() || undefined,
+              text: srcText || undefined,
+              name: wanted || undefined,
+              save: true,
+            }),
+          }));
+        setGenBusy(false);
+        // 形状兜底：将来若又把 `await` 写丢，这里会给出"没拿到回执"而不是一句空话
+        if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+          setGenMsg('换声失败：前端没拿到宿主回执（多半是代码 bug，请把这句话发我）');
+          return;
+        }
+        if (!result.ok) {
+          setGenMsg(`换声失败：${(result.data && result.data.error) || result.error
+            || (result.status ? `HTTP ${result.status}` : '宿主没有响应')}`);
+          return;
+        }
+        const item = (result.data && result.data.item) || null;
+        const play = (result.data && result.data.play) || null;
+        setGenMsg(item
+          ? `已换声 ${item.file}（${prettyDuration(item.durationMs) || '时长未知'}，${prettyBytes(item.bytes)}），正在播…`
+          : '已换声，正在播…');
+        if (play && play.url && bus.handlers) {
+          await bus.handlers.playItems([{ id: play.id, url: play.url, chars: 0 }], '');
+        }
+        await loadGen();
+      }, [loadGen]);
+      const submitGen = useCallback(async () => {
+        if (submitLock.current) return;
+        submitLock.current = true;
+        try {
+        const form = genForm;
+        // B3：变声档是另一条链路（源是音频不是文本、走 /convert、非流式），在这里分出去
+        if (genModeOf(form, genCaps) === 'changer') { await submitConvert(form); return; }
+        const text = String(form.text || '').trim();
+        if (!text) { setGenMsg('先写要合成的文本'); return; }
+        /*
+         * B2（0.99.0）：抽卡。`take≥2` 且这家认 seed → 把 seed 递增生一串交给宿主，
+         * 宿主逐粒合成、逐粒落盘、**都不播**，回来由用户在列表里挑。
+         * 只有认 seed 的引擎才允许（面板按 `caps.sampling` 决定露不露这一格）。
+         */
+        const sampling = Array.isArray(genCaps && genCaps.sampling) ? genCaps.sampling : [];
+        const take = Math.min(4, Math.max(1, Math.round(Number(form.take) || 1)));
+        const baseSeed = Number(form.seed);
+        const seeds = (sampling.includes('seed') && take > 1)
+          ? Array.from({ length: take }, (_x, i) => (Number.isFinite(baseSeed) ? Math.round(baseSeed) : 42) + i)
+          : undefined;
+        setGenBusy(true);
+        setGenMsg(seeds ? `正在抽 ${seeds.length} 粒…（每粒都要合成一次，慢一点）` : '正在合成…（长句要等一会儿）');
+        const result = await getJson('/voice-breeze/gen', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            name: String(form.name || '').trim() || undefined,
+            mode: form.mode,
+            seeds,
+            voice: String(form.voice || '').trim() || undefined,
+            instructions: String(form.instructions || '').trim() || undefined,
+            ...genSamplingFromForm(form),
+            style: genStyleFromForm(form),
+            // VoicePanel 里没有 `sessionId` 变量（那是 dock 的），会话只从共享仓拿（`store.sessionId`）
+            session: store.sessionId,
+          }),
+        });
+        setGenBusy(false);
+        if (!result.ok) {
+          setGenMsg(`生成失败：${(result.data && result.data.error) || result.status || ''}`);
+          return;
+        }
+        // 抽卡回来是一批：不自动播，让用户自己挑（点了才播）
+        const picked = (result.data && result.data.items) || null;
+        if (Array.isArray(picked) && picked.length > 1) {
+          setGenMsg(`抽了 ${picked.length} 粒（seed ${picked.map((one) => one.seed).join(' / ')}）· 都没播 · 下面点哪条播哪条`);
+          await loadGen();
+          return;
+        }
+        const item = (result.data && result.data.item) || null;
+        const play = (result.data && result.data.play) || null;
+        setGenMsg(item
+          ? `已生成 ${item.file}（${prettyDuration(item.durationMs) || '时长未知'}，${prettyBytes(item.bytes)}），正在播…`
+          : '已生成，正在播…');
+        // 生成后自动播一遍（走与播报同一个播放器，音量/停止都跟着全局）
+        if (play && play.url && bus.handlers) {
+          await bus.handlers.playItems([{ id: play.id, url: play.url, chars: text.length }], '');
+        }
+        await loadGen();
+        } finally {
+          submitLock.current = false;
+        }
+      }, [genForm, loadGen, genCaps, submitConvert]);
+
+
+      const genPost = useCallback(async (payload) => {
+        const result = await getJson('/voice-breeze/gen', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (result.ok) {
+          setGenInfo(result.data);
+          setGenMsg('');
+        } else {
+          setGenMsg(`操作失败：${(result.data && result.data.error) || result.status || ''}`);
+        }
+        return result;
+      }, []);
+
+      const playGen = useCallback(async (item) => {
+        if (!item || !item.url || !bus.handlers) return;
+        await bus.handlers.playItems([{ id: item.file, url: item.url, chars: item.chars }], '');
+      }, []);
+
+      /**
+       * G4a（1.0.8）：**批量生成**。一行一条，最多 20 条。
+       *
+       * 与「生成并播放」的区别（三条都要说清，不然用户会以为是同一个按钮）：
+       *  ① 每条**各自落盘**、**一条都不自动播**（N 条一起进队列会吵成一团，同抽卡的理由）；
+       *  ② **不抽卡** 抽卡是"同一句 × N 个种子"，批量是"N 句 × 每个 1 次"，两件事不要叠；
+       *  ③ **失败的照样往下走** 某行太长/被引擎拒了就记进 `failed`，不让它把后面的行一起废掉。
+       * 截断到 20 条在客户端先做一次：顺手把"太长了"这句话在点之前就说清楚，别等宿主回 400。
+       */
+      const submitBatch = useCallback(async () => {
+        const lines = String(genBatch || '')
+          .split(/\r?\n/)
+          .map((one) => one.trim())
+          .filter(Boolean);
+        if (!lines.length) { setGenMsg('批量要先写几行文本（一行一条）'); return; }
+        if (lines.length > 20) { setGenMsg(`一次最多 20 条（现在 ${lines.length} 行）—— 分两批来吧`); return; }
+        if (submitLock.current) return;
+        submitLock.current = true;
+        setGenBusy(true);
+        setGenMsg(`正在批量生成 ${lines.length} 条…（引擎串行，一条一条来；都不自动播）`);
+        try {
+          const result = await getJson('/voice-breeze/gen', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              action: 'batch',
+              texts: lines,
+              namePrefix: String(genForm.name || '').trim() || undefined,
+              mode: genForm.mode,
+              voice: String(genForm.voice || '').trim() || undefined,
+              instructions: String(genForm.instructions || '').trim() || undefined,
+              ...genSamplingFromForm(genForm),
+              style: genStyleFromForm(genForm),
+              session: store.sessionId,
+            }),
+          });
+          const data = (result.data && typeof result.data === 'object') ? result.data : {};
+          if (!result || typeof result.ok !== 'boolean') {
+            setGenMsg('批量失败：前端没拿到宿主回执（多半是代码 bug，请把这句发我）');
+            return;
+          }
+          if (!result.ok) {
+            setGenMsg(`批量失败：${data.error || (result.status ? `HTTP ${result.status}` : '宿主没有响应')}`);
+            return;
+          }
+          const took = Number(data.take) || 0;
+          const failed = Array.isArray(data.failed) ? data.failed : [];
+          setGenMsg(failed.length
+            ? `批量完成 ${took} 条，${failed.length} 条失败：${failed.map((one) => `第 ${one.index + 1} 行「${one.text}」${one.error}`).join('；')}`
+            : `批量完成 ${took} 条（都没自动播，去下面列表里点着听）`);
+        } finally {
+          submitLock.current = false;
+          setGenBusy(false);
+        }
+        await loadGen();
+      }, [genBatch, genForm, loadGen]);
+
+      /**
+       * G4c（1.0.8）：**拖拽排序**。把 `fromFile` 挪到 `toFile` 的位置，整张顺序写给宿主。
+       *
+       * 为什么整张传而不是"交换两条"：顺序是 index 的数组顺序，一次给全量才没有中间态
+       * （交换两次 = 两次写盘，中间崩一次就乱了）。宿主那边 `reorderEntries()` 还会去重、
+       * 丢弃不存在的名字、把没提到的补齐 —— 客户端算错也只是"顺序不对"，不会丢记录。
+       */
+      const reorderGen = useCallback(async (fromFile, toFile) => {
+        if (!fromFile || !toFile || fromFile === toFile) return;
+        const files = ((genInfo && genInfo.items) || []).map((one) => one.file);
+        const from = files.indexOf(fromFile);
+        const to = files.indexOf(toFile);
+        if (from < 0 || to < 0) return;
+        const order = files.slice();
+        const [moved] = order.splice(from, 1);
+        order.splice(to, 0, moved);
+        const result = await genPost({ action: 'reorder', order });
+        if (result.ok) setGenMsg('顺序已保存（只影响这个列表，不动文件）');
+      }, [genInfo, genPost]);
+
       if (!shared.panelOpen) return null;
 
       const startDrag = (event) => {
@@ -1478,6 +2253,1065 @@ window.__ModuleLoader__.load({
       const divider = (key) => h('div', { key, style: U.divider });
       const sceneLabel = sel.startsWith('scene:') ? sel.slice('scene:'.length) : '';
 
+      /**
+       * 2026-11-18：**渲染期兜底**。
+       *
+       * 面板是"一个组件画五页"，任何一页在**渲染期**抛错都会把整棵子树带走 ——
+       * 表现就是「点开就消失、之后再点 🎙 也打不开」（`panelOpen` 还是 true，界面上却什么都没有）。
+       * 这一段把"把五页都算出来"这件事挪进一个 `try` 里：哪一页炸了，就只有那一页的位置变成
+       * 一张错误卡，标题栏与页签行照旧 —— 用户能拖、能关、能切页。
+       *
+       * **必须是"传函数"而不是直接算** 数组元素在回调里求值，异常才会真的落进 `catch`。
+       */
+      const safeParts = (build) => {
+        try {
+          return build();
+        } catch (error) {
+          const message = String((error && error.message) || error);
+          // 现场留痕：界面上的错和日志里的错必须在同一个地方对得上（这个教训）
+          clog(`page:render-fail tab=${tab} ${message}`);
+          return [h('div', {
+            key: 'render-fail',
+            style: {
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              padding: 12,
+              borderRadius: 8,
+              border: '1px solid var(--dsw-alias-border-l2)',
+              background: 'var(--dsw-alias-bg-layer-1)',
+              color: 'var(--dsw-alias-label-primary)',
+              fontSize: 12,
+              lineHeight: 1.6,
+            },
+          }, [
+            h('div', { key: 't', style: { fontWeight: 700 } }, `⚠ 「${tab}」这一页渲染出错`),
+            h('div', {
+              key: 'm',
+              style: { color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+            }, message),
+            h('div', {
+              key: 'x',
+              style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' },
+            }, '面板还活着：切到别的页签再切回来就是干净的；这条已写进 events.log 的 client 时间线。'),
+          ])];
+        }
+      };
+
+      /**
+       * （G2）：生成页。**控件按宿主给的 `caps` 现渲染**（`/engine` 快照里的那一段，
+       * 与「引擎」页风格块同源 = `engineCaps()` 唯一真相）：
+       * breeze / 普通兼容端点只出「文本 + 音色 + 文件名 + 目录」；MiniMax 才多出情绪 / 音效 / 三个数字 / 调音台。
+       * 这里**不做第二份"这家支持什么"的判断**，也不按域名猜（那是引擎页的历史教训）。
+       */
+      const genPage = () => {
+        const info = genInfo;
+        const caps = genCaps || {};
+        const items = (info && info.items) || [];
+        const form = genForm;
+        const upd = (patch) => setGenForm((prev) => ({ ...prev, ...patch }));
+        const emotions = Array.isArray(caps.emotions) ? caps.emotions : [];
+        const maxChars = Number(caps.maxChars) || 2000;
+        /*
+         * B1（0.98.0）：模式**只认宿主给的 `caps.modes`**（`engineCaps()` 那一份真相）。
+         * 表单里留着一个这家不认的模式时，退回它支持的最后一个（breeze → direction、
+         * minimax → clone），别把 `direction` 发给一个没有指令概念的引擎。
+         */
+        const modes = Array.isArray(caps.modes) && caps.modes.length ? caps.modes : ['clone'];
+        // 与 `submitGen` 用**同一个**判断，避免"界面显示变声、实际提交 design"这类错位
+        const mode = genModeOf(form, caps);
+        const MODE_LABEL = { design: '设计声', clone: '克隆声', direction: '指挥语气', changer: '变声' };
+        /*
+         * 2026-11-18：变声期间把按钮按下去。
+         * `/state.converting` 是宿主给的（`convertBusy > 0`）—— 引擎单并发，连续点几次会让
+         * 每次请求都排队 409，而用户视觉上只看到"点了没反应"，于是继续点。
+         * 这里给一个**看得见的忙态**（文案也换掉），比后台偷偷排队友好。
+         */
+        const converting = Boolean(shared.state && shared.state.converting);
+        const busyNow = genBusy || (mode === 'changer' && converting);
+        // 键集必须两个状态完全一致（坑 13），所以只改值不增删键
+        const modeBtnStyle = (one) => ({
+          ...U.btnTiny,
+          fontWeight: mode === one ? 700 : 400,
+          color: mode === one ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+        });
+        const rowStyle = { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' };
+        const numInput = (key, placeholder, value, width) => h('input', {
+          key,
+          value: value === undefined || value === null ? '' : String(value),
+          placeholder,
+          spellCheck: false,
+          inputMode: 'decimal',
+          onChange: (event) => upd({ [key]: event.target.value }),
+          style: { ...INPUT_STYLE, flex: `0 0 ${width || 58}px`, minWidth: 0, textAlign: 'center' },
+        });
+        /*
+         * B2（0.99.0）：采样格子按能力现渲染（`seed` 单独一行，因为要配「抽卡」粒数）。
+         *
+         * **这段必须待在 `numInput` 定义之后** 它是立即执行的 IIFE，写在前面就会在渲染期
+         * 撞上 `const numInput` 的暂时性死区（TDZ）—— `node --check` 查不出来，一进「生成」页
+         * 就抛 `Cannot access 'numInput' before initialization`，React 随即卸掉整个面板
+         * （表现：点开就消失、再点 🎙 也打不开）。见 `logs/162` / `06` 坑 41。
+         */
+        const sampling = Array.isArray(caps.sampling) ? caps.sampling : [];
+        const sampleCells = (() => {
+          const cells = [];
+          const put = (key, label, width) => {
+            if (!sampling.includes(key)) return;
+            cells.push(numInput(key, label, form[key], width));
+          };
+          /*
+           * 变声档是**另一套参数与默认值**（`docs/voice-conversion.md`）：
+           * `temperature 0.3 / top_k 1 / cfg_scale 1.0 / seed 42`，**近乎贪心** ——
+           * 官方明说开采样会让源音色漏回来，所以那四格只给这几项，placeholder 写死转换默认值。
+           */
+          if (mode === 'changer') {
+            cells.push(numInput('temperature', '温度(0.3)', form.temperature, 78));
+            cells.push(numInput('top_k', 'top_k(1)', form.top_k, 70));
+            cells.push(numInput('cfg_scale', '引导(1)', form.cfg_scale, 74));
+            cells.push(numInput('seed', '种子(42)', form.seed, 76));
+            return cells;
+          }
+          // 引导强度排第一：它是"设计/指挥/克隆"三档差别最大的那一项
+          if (sampling.includes('cfg_scale')) {
+            const auto = mode === 'design' ? 4 : (mode === 'clone' ? 1 : 2.5);
+            cells.push(numInput('cfg_scale', `引导(空=${auto})`, form.cfg_scale, 88));
+          }
+          put('temperature', '温度', 70);
+          put('top_k', 'top_k', 62);
+          put('top_p', 'top_p', 62);
+          put('repetition_penalty', '重复罚', 70);
+          put('max_new_tokens', '帧上限', 70);
+          put('split_chars', '切分', 62);
+          return cells;
+        })();
+        return h('div', { key: 'gen', style: { display: 'flex', flexDirection: 'column', gap: 12 } }, [
+          card('genform', [
+            cardHead('h', '生成一段音频'),
+            modes.length > 1 ? h('div', { key: 'modes', style: rowStyle }, [
+              h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '模式'),
+              ...modes.map((one) => h('button', {
+                key: one,
+                type: 'button',
+                style: modeBtnStyle(one),
+                onClick: () => upd({ mode: one }),
+              }, MODE_LABEL[one] || one)),
+            ]) : null,
+            modes.length > 1 ? hint('mh', mode === 'design'
+              ? '设计声：不给音色，照下面那段描述现造一把嗓子；同 seed 可复现。引导 4。'
+              : (mode === 'clone'
+                ? '克隆声：只换嗓子、不带指令（要语气请切「指挥语气」）。引导 1。'
+                : (mode === 'changer'
+                  ? '变声：拿一段已有录音换成目标音色，保留内容与节奏；KEEP MELODY 0 说话 / 1~2 唱歌。'
+                  : '指挥语气：在给定音色上按指令演。引导 2.5，3 以上易刺耳。'))) : null,
+            hint('d', `这一页产出的是**文件**（只出 wav）。当前引擎：${caps.kind || 'breeze'}，单次最多 ${maxChars} 字；`
+              + '生成完会自动播一遍。想改全局音色/风格还是去「引擎」页，这里只影响这一次。'),
+            /*
+             * B3：变声的**源音频**（三入口里面板能用的两个）。
+             * 第三个「工具传本机路径」只对模型开放 —— 浏览器端不该有能力让宿主读任意本机文件。
+             */
+            mode === 'changer' ? h('div', { key: 'src', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+              h('div', { key: 'row', style: rowStyle }, [
+                h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '源音频'),
+                h('select', {
+                  key: 'pick',
+                  value: form.srcFile ? '' : form.srcName,
+                  onChange: (event) => upd({ srcName: event.target.value, srcFile: null }),
+                  style: { ...INPUT_STYLE, flex: '1 1 200px', minWidth: 0 },
+                }, [
+                  h('option', { key: '', value: '' }, items.length ? '从下面的生成列表里挑一条' : '（生成列表还是空的）'),
+                  ...items.map((one) => h('option', { key: one.file, value: one.file },
+                    `${one.file}${one.durationMs ? `（${prettyDuration(one.durationMs)}）` : ''}`)),
+                ]),
+              ]),
+              h('div', { key: 'row2', style: rowStyle }, [
+                h('input', {
+                  key: 'file',
+                  type: 'file',
+                  accept: '.wav,audio/wav',
+                  onChange: (event) => {
+                    const picked = (event.target.files && event.target.files[0]) || null;
+                    // 上传与"列表里挑"互斥：选了文件就把列表选择清掉，免得用户以为两个都生效
+                    upd({ srcFile: picked, srcName: picked ? '' : form.srcName });
+                  },
+                  style: { ...INPUT_STYLE, flex: '1 1 220px', paddingTop: 3, fontSize: 11 },
+                }),
+                form.srcFile ? h('span', { key: 'n', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                  `已选：${form.srcFile.name}（${prettyBytes(form.srcFile.size)}）`) : null,
+              ]),
+              h('span', { key: 'tip', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                converting
+                  ? '⚠ 引擎正在处理上一段变声（单并发）—— 等它回来再点，播报这会儿也会排队。'
+                  : '只收 wav。变声是**非流式**的：引擎要先编码完整个源才出声，长素材会比生成慢得多。'),
+            ]) : null,
+            h('textarea', {
+              key: 'text',
+              value: form.text,
+              placeholder: mode === 'changer'
+                ? '源录音的逐字稿（可选；**唱歌时强烈建议给**，不给稿容易把词听成别的）'
+                : '要合成的文本（可以写停顿记号；认不认识看引擎能力）',
+              spellCheck: false,
+              onChange: (event) => upd({ text: event.target.value }),
+              style: { ...TEXTAREA_STYLE, minHeight: 92 },
+            }),
+            h('div', { key: 'row1', style: rowStyle }, [
+              h('input', {
+                key: 'name',
+                value: form.name,
+                placeholder: '文件名（可空，默认取文本前 12 字）',
+                spellCheck: false,
+                onChange: (event) => upd({ name: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '1 1 160px' },
+              }),
+              /*
+               * 2026-11-17 用户定：**该模式没有的控件直接不渲染，不置灰** —— 置灰既占地方又像坏了。
+               * 设计声不需要音色（模式那行已经说明"不给音色"），所以这一格整个空出来给文件名。
+               */
+              mode === 'design' ? null : (genVoices.length ? h('select', {
+                key: 'voice',
+                value: form.voice,
+                onChange: (event) => upd({ voice: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '1 1 180px' },
+              }, [
+                h('option', { key: '', value: '' }, '音色：用当前会话音色'),
+                ...genVoices.map((one) => h('option', {
+                  key: one.id,
+                  value: one.id,
+                }, one.name && one.name !== one.id ? `${one.name} · ${one.id}` : one.id)),
+              ]) : h('input', {
+                key: 'voice',
+                value: form.voice,
+                placeholder: '音色 id（这家不提供清单，可留空）',
+                spellCheck: false,
+                onChange: (event) => upd({ voice: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '1 1 180px' },
+              })),
+            ]),
+            // 按能力现渲染：情绪（这家有情绪档才出）
+            (emotions.length || caps.voiceModify) ? h('div', { key: 'caps1', style: rowStyle }, [
+              emotions.length ? h('select', {
+                key: 'emotion',
+                value: form.emotion,
+                onChange: (event) => upd({ emotion: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '1 1 140px' },
+              }, [
+                h('option', { key: '', value: '' }, '情绪：自动（用全局）'),
+                ...emotions.map((one) => h('option', { key: one, value: one }, `情绪：${one}`)),
+              ]) : null,
+              caps.voiceModify ? h('select', {
+                key: 'fx',
+                value: form.soundEffects,
+                onChange: (event) => upd({ soundEffects: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '1 1 140px' },
+              }, [
+                h('option', { key: '', value: '' }, '音效：无'),
+                h('option', { key: 'spacious_echo', value: 'spacious_echo' }, '音效：空旷回声'),
+                h('option', { key: 'auditorium_echo', value: 'auditorium_echo' }, '音效：礼堂'),
+                h('option', { key: 'lofi_telephone', value: 'lofi_telephone' }, '音效：电话'),
+                h('option', { key: 'robotic', value: 'robotic' }, '音效：机器人'),
+              ]) : null,
+            ]) : null,
+            // 按能力现渲染：三个数字（只有认识 voice_setting 的引擎才出）
+            caps.voiceSetting ? h('div', { key: 'caps2', style: rowStyle }, [
+              numInput('speed', '语速', form.speed, 58),
+              numInput('vol', '音量', form.vol, 58),
+              numInput('pitch', '音调', form.pitch, 58),
+              caps.voiceModify ? numInput('vmPitch', '低沉↔明亮', form.vmPitch, 86) : null,
+              caps.voiceModify ? numInput('vmIntensity', '有力↔柔和', form.vmIntensity, 86) : null,
+              caps.voiceModify ? numInput('vmTimbre', '厚重↔清脆', form.vmTimbre, 86) : null,
+            ]) : null,
+            caps.voiceSetting ? hint('sh', '语速 0.5~2 · 音量 0.01~10 · 音调 ±12 · 调音台三项 ±100（0 或留空 = 不动）') : null,
+            // 混音（只在 `caps.timbreMix` 为真时出现）。规则跟「引擎」页同一套：
+            // 最多 4 条、权重 1~100、**少于两条不生效**（`genStyleFromForm()` 里就按这个筛）。
+            caps.timbreMix ? (() => {
+              const mixes = Array.isArray(form.mixes) ? form.mixes : [];
+              const setMixes = (next) => upd({ mixes: next.slice(0, 4) });
+              const options = genVoices.length ? genVoices : [{ id: '', name: '（先切到引擎页拉一次清单）' }];
+              return h('div', { key: 'mix', style: { display: 'flex', flexDirection: 'column', gap: 4 } }, [
+                h('div', { key: 'h', style: rowStyle }, [
+                  h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                    `多音色混音（${mixes.length}/4，至少两条才生效）`),
+                  h('button', {
+                    key: 'add',
+                    type: 'button',
+                    disabled: mixes.length >= 4,
+                    style: { ...U.btnTiny, opacity: mixes.length >= 4 ? 0.4 : 1 },
+                    onClick: () => setMixes([...mixes, { voice_id: (genVoices[0] && genVoices[0].id) || '', weight: 50 }]),
+                  }, '＋ 加一个'),
+                ]),
+                ...mixes.map((one, i) => h('div', { key: `m${i}`, style: rowStyle }, [
+                  h('select', {
+                    key: 'v',
+                    value: one.voice_id || '',
+                    style: { ...INPUT_STYLE, flex: '1 1 auto', minWidth: 0 },
+                    onChange: (event) => {
+                      const next = mixes.slice();
+                      next[i] = { ...one, voice_id: event.target.value };
+                      setMixes(next);
+                    },
+                  }, options.map((v) => h('option', { key: v.id || v, value: v.id || v },
+                    v.name && v.name !== (v.id || v) ? `${v.name} · ${v.id}` : (v.id || v)))),
+                  h('input', {
+                    key: 'w',
+                    value: one.weight === undefined || one.weight === null ? '' : String(one.weight),
+                    placeholder: '权重',
+                    spellCheck: false,
+                    inputMode: 'numeric',
+                    style: { ...INPUT_STYLE, flex: '0 0 62px', minWidth: 0, textAlign: 'center' },
+                    onChange: (event) => {
+                      const next = mixes.slice();
+                      next[i] = { ...one, weight: event.target.value };
+                      setMixes(next);
+                    },
+                  }),
+                  h('button', {
+                    key: 'x',
+                    type: 'button',
+                    style: U.btnTiny,
+                    onClick: () => setMixes(mixes.filter((_x, k) => k !== i)),
+                  }, '删'),
+                ])),
+              ]);
+            })() : null,
+            // B3：KEEP MELODY 只有变声档有意义（0 说话 / 1~2 唱歌）
+            mode === 'changer' ? h('div', { key: 'keep', style: rowStyle }, [
+              h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, 'KEEP MELODY'),
+              h('select', {
+                key: 'k',
+                value: form.keep,
+                onChange: (event) => upd({ keep: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '0 0 200px', minWidth: 0 },
+              }, [
+                h('option', { key: '0', value: '0' }, '0 · 说话（默认）'),
+                h('option', { key: '1', value: '1' }, '1 · 唱歌：多留一点旋律'),
+                h('option', { key: '2', value: '2' }, '2 · 唱歌：旋律更明显（可能不稳）'),
+              ]),
+              h('span', { key: 'tip', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                '说话请留 0；>2 会起哄'),
+            ]) : null,
+            // 克隆声**没有**指令这个概念（带了就变成指挥声），变声也不吃指令 —— 两档都不渲染这格
+            (mode === 'clone' || mode === 'changer') ? null : h('input', {
+              key: 'inst',
+              value: form.instructions,
+              placeholder: mode === 'design'
+                ? '音色描述：身份底座 + 音质特征 + 表达风格 + 场景口音，四要素写全'
+                : '语气指令：情绪 / 语速 / 气声（只有部分引擎认这一项）',
+              spellCheck: false,
+              onChange: (event) => upd({ instructions: event.target.value }),
+              style: INPUT_STYLE,
+            }),
+            /*
+             * B2（0.99.0）：**高级区默认展开**—— 采样参数是这台的常用旋钮，
+             * 收起来等于没有。只渲染 `caps.sampling` 里有的那几格：breeze 全有，minimax/兼容端点
+             * 一个都不认，这一整块直接不出现。
+             */
+            (sampling.includes('seed') && mode !== 'changer') ? h('div', { key: 'seedrow', style: rowStyle }, [
+              h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '种子'),
+              numInput('seed', '随机种子', form.seed, 70),
+              h('span', { key: 't2', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '抽卡'),
+              h('select', {
+                key: 'take',
+                value: form.take,
+                onChange: (event) => upd({ take: event.target.value }),
+                style: { ...INPUT_STYLE, flex: '0 0 84px', minWidth: 0 },
+              }, ['1', '2', '3', '4'].map((n) => h('option', { key: n, value: n }, `${n} 粒`))),
+            ]) : null,
+            // 折叠条（默认收起）：常用的是种子/抽卡，采样六项是"偶尔才动"的旋钮
+            sampleCells.length ? h('button', {
+              key: 'adv',
+              type: 'button',
+              style: { ...U.btnTiny, alignSelf: 'flex-start' },
+              onClick: () => setGenAdv((v) => !v),
+            }, genAdv
+              ? `▾ 高级：${mode === 'changer' ? '转换参数' : '采样参数'}（收起）`
+              : (mode === 'changer'
+                ? `▸ 高级：转换参数（4 项，默认 0.3 / 1 / 1 / 42）`
+                : `▸ 高级：采样参数（${sampleCells.length} 项，默认留空）`)) : null,
+            (sampleCells.length && genAdv) ? h('div', { key: 'sample', style: rowStyle }, sampleCells) : null,
+            (sampleCells.length && genAdv) ? hint('sh2', mode === 'changer'
+              ? '留空 = 转换默认（温度 0.3 / top_k 1 / 引导 1 / 种子 42）。**开大采样会让源音色漏回来** ——'
+                + '官方就是为此把转换的默认压到近乎贪心。'
+              : '留空 = 引擎默认（种子 42；引导按模式：设计 4 / 克隆 1 / 指挥 2.5）。'
+                + '温度抬一点更活、也更容易漏字；帧上限是防模型自己跑飞。') : null,
+            /*
+             * G4a（1.0.8）：批量。**默认收起** —— 它是偶发操作，摊开会把表单顶长一大截。
+             * 用独立的 `genBatch`（不借用表单的 `text`）：批量输入不该把单条正文顶掉，
+             * 反过来也一样 —— 用户常常是"先写好一句试听，满意了再批量跑同款参数"。
+             */
+            (mode === 'changer' ? null : h('div', { key: 'batch', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+              h('button', {
+                key: 't',
+                type: 'button',
+                style: { ...U.btnTiny, alignSelf: 'flex-start' },
+                onClick: () => setGenBatchOpen((v) => !v),
+              }, genBatchOpen ? '▾ 批量：一行一条（收起）' : '▸ 批量：一行一条，最多 20 条'),
+              genBatchOpen ? h('textarea', {
+                key: 'ta',
+                value: genBatch,
+                placeholder: '一行一条，逐条生成、各自落盘；**一条都不自动播**；失败的行会单独报出来，不影响后面的',
+                spellCheck: false,
+                onChange: (event) => setGenBatch(event.target.value),
+                style: { ...TEXTAREA_STYLE, minHeight: 78, ...U.mono, fontSize: 11.5 },
+              }) : null,
+              genBatchOpen ? h('div', { key: 'row', style: rowStyle }, [
+                h('button', {
+                  key: 'go',
+                  type: 'button',
+                  style: { ...U.btnTiny, fontWeight: 700, opacity: busyNow ? 0.6 : 1 },
+                  disabled: busyNow,
+                  onClick: () => void submitBatch(),
+                }, busyNow ? '批量进行中…' : '批量生成（不播）'),
+                h('span', { key: 'n', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                  `${String(genBatch || '').split(/\r?\n/).filter((one) => one.trim()).length} 行 · 用上面那套模式/音色/采样参数`),
+              ]) : null,
+            ])),
+            divider('gd1'),
+            h('div', { key: 'dir', style: rowStyle }, [
+              h('input', {
+                key: 'd',
+                value: genDir,
+                placeholder: '输出目录（留空 = 插件目录下的 generated）',
+                spellCheck: false,
+                onChange: (event) => setGenDir(event.target.value),
+                style: { ...INPUT_STYLE, flex: '1 1 240px', ...U.mono, fontSize: 11.5 },
+              }),
+              h('button', {
+                key: 'saveDir',
+                type: 'button',
+                style: U.btnTiny,
+                onClick: async () => {
+                  const result = await genPost({ action: 'dir', dir: String(genDir || '').trim() });
+                  if (result.ok) setGenMsg(`输出目录已设为 ${(result.data && result.data.dir) || ''}`);
+                },
+              }, '保存目录'),
+              h('button', {
+                key: 'open',
+                type: 'button',
+                style: U.btnTiny,
+                onClick: () => void openFolder('generated'),
+              }, '在文件夹中显示'),
+            ]),
+            h('div', { key: 'act', style: rowStyle }, [
+              h('button', {
+                key: 'go',
+                type: 'button',
+                style: { ...U.btn, fontWeight: 700, opacity: busyNow ? 0.6 : 1 },
+                disabled: busyNow,
+                onClick: () => void submitGen(),
+              }, busyNow
+                ? (mode === 'changer' ? '正在换声…' : '正在生成…')
+                : (mode === 'changer' ? '换声并播放' : '生成并播放')),
+              h('button', {
+                key: 'reset',
+                type: 'button',
+                style: U.btnTiny,
+                onClick: () => { setGenForm({ ...EMPTY_GEN_FORM }); setGenMsg(''); setGenFilledAt(''); },
+              }, '清空表单'),
+              /*
+               * 2026-11-18：错误信息以前是个不换行的 `span`，长中文会直接溢出被面板裁掉 ——
+               * 用户看到的是"换声失败："后面空着，等于没有信息。现在允许换行、可断词、占满一行，
+               * 并且把全文塞进 `title`（悬停能看完整的）。
+               */
+              genMsg ? h('span', {
+                key: 'msg',
+                title: genMsg,
+                style: {
+                  flex: '1 1 100%',
+                  minWidth: 0,
+                  fontSize: 11,
+                  color: 'var(--dsw-alias-label-secondary)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                },
+              }, genMsg) : null,
+            ]),
+          ]),
+
+          card('genlist', [
+            cardHead('h', `已生成的音频（${items.length}）`, [
+              h('button', {
+                key: 'refresh',
+                type: 'button',
+                style: U.btnTiny,
+                onClick: () => void loadGen(),
+              }, '刷新'),
+            ]),
+            hint('d', info ? `输出目录：${info.dir}（重名自动加 -1/-2，不覆盖已有文件；删除会挪进插件的 gen-trash）` : '读取中…'),
+            /*
+             * G5（1.0.9）：垃圾桶状态 + 手动清空。
+             *
+             * 为什么要有这一行：删除是"挪进垃圾桶"，删得越多盘上越占地方，而用户看不到它 ——
+             * 上限 128 MB 的自动淘汰是兜底，这一行是"知情权"。
+             * 交互照旧：点「清理」变「确认清空?」，4 秒不点自己取消（与删除音频同一套手感）。
+             */
+            (info && info.trash) ? h('div', { key: 'trash', style: rowStyle }, [
+              h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                `垃圾桶：${info.trash.count} 个 · ${prettyBytes(info.trash.bytes)}`
+                + `（上限 ${info.trash.maxBytes > 0 ? prettyBytes(info.trash.maxBytes) : '不限'}，超了自动删最旧的）`),
+              genTrashDel
+                ? h('button', {
+                  key: 'del2',
+                  type: 'button',
+                  style: { ...U.btnTiny, ...U.btnDanger },
+                  onClick: async () => {
+                    const result = await genPost({ action: 'trash-empty' });
+                    setGenTrashDel(false);
+                    if (result.ok) {
+                      const data = result.data || {};
+                      setGenMsg(`垃圾桶已清空：${Number(data.count) || 0} 个 · 释放 ${prettyBytes(Number(data.freed) || 0)}`);
+                    }
+                  },
+                }, '确认清空?')
+                : h('button', {
+                  key: 'del',
+                  type: 'button',
+                  style: U.btnTiny,
+                  disabled: !info.trash.count,
+                  onClick: () => setGenTrashDel(true),
+                }, info.trash.count ? '清理' : '已空'),
+              h('button', {
+                key: 'open',
+                type: 'button',
+                style: U.btnTiny,
+                onClick: () => void openFolder('gen-trash'),
+              }, '打开垃圾桶'),
+            ]) : null,
+            items.length
+              ? h('div', { key: 'list', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+                items.map((item) => h('div', {
+                  key: item.file,
+                  /*
+                   * G4c（1.0.8）：拖一条到另一条上 = 挪到它的位置。
+                   * 用原生 HTML5 拖放（零依赖，客户端不许引 npm）。
+                   * **`opacity` 两个状态都在**（坑 13：键集必须一致，只改值），别在这里增删键。
+                   */
+                  draggable: true,
+                  onDragStart: (event) => {
+                    setGenDrag(item.file);
+                    try {
+                      event.dataTransfer.setData('text/plain', item.file);
+                      event.dataTransfer.effectAllowed = 'move';
+                    } catch { /* 某些环境禁 dataTransfer，退化成 genDrag */ }
+                  },
+                  onDragEnd: () => setGenDrag(''),
+                  onDragOver: (event) => {
+                    if (!genDrag || genDrag === item.file) return;
+                    try { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } catch { /* ignore */ }
+                  },
+                  onDrop: (event) => {
+                    try { event.preventDefault(); } catch { /* ignore */ }
+                    let from = genDrag;
+                    try { from = event.dataTransfer.getData('text/plain') || from; } catch { /* ignore */ }
+                    setGenDrag('');
+                    void reorderGen(from, item.file);
+                  },
+                  style: {
+                    border: '1px solid var(--dsw-alias-border-l1)',
+                    borderRadius: 8,
+                    padding: '6px 8px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                    opacity: genDrag === item.file ? 0.45 : 1,
+                    cursor: 'grab',
+                  },
+                }, [
+                  h('div', { key: 'r1', style: { ...rowStyle, justifyContent: 'space-between' } }, [
+                    h('span', {
+                      key: 'n',
+                      style: {
+                        fontSize: 12,
+                        fontWeight: 600,
+                        flex: '1 1 auto',
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      },
+                      title: item.file,
+                    }, item.file),
+                    h('span', {
+                      key: 'src',
+                      style: { ...U.badge, padding: '0 7px' },
+                    }, item.source === 'model' ? '模型生成' : '我生成的'),
+                    h('button', {
+                      key: 'play',
+                      type: 'button',
+                      style: U.btnTiny,
+                      onClick: () => void playGen(item),
+                    }, '播放'),
+                    /*
+                     * G4b（1.0.8）：「拿来再生成」—— 把这条记录的**整套参数**填回上面的表单。
+                     *
+                     * 它替代的是"只回填模型最后那一条"的旧闭环：现在任意一条都能当模板，
+                     * 而且 `genFilledAt` 一起写上，免得自动回填逻辑过一会儿又把它盖掉。
+                     */
+                    h('button', {
+                      key: 'refill',
+                      type: 'button',
+                      style: U.btnTiny,
+                      title: '把这条用的文本/模式/音色/种子/采样参数填回上面',
+                      onClick: () => {
+                        setGenForm(formFromEntry(item));
+                        setGenFilledAt(String(item.at || item.file || ''));
+                        setGenMsg(`已把 ${item.file} 的参数填回上面，改完点「${String(item.genMode || '') === 'changer' ? '换声并播放' : '生成并播放'}」`);
+                      },
+                    }, '再生成'),
+                    h('button', {
+                      key: 'ren',
+                      type: 'button',
+                      style: U.btnTiny,
+                      onClick: () => setGenRename({ from: item.name, to: item.name }),
+                    }, '重命名'),
+                    genDel === item.file
+                      ? h('button', {
+                        key: 'del2',
+                        type: 'button',
+                        style: { ...U.btnTiny, ...U.btnDanger },
+                        onClick: async () => {
+                          await genPost({ action: 'delete', name: item.name });
+                          setGenDel('');
+                        },
+                      }, '确认删除?')
+                      : h('button', {
+                        key: 'del',
+                        type: 'button',
+                        style: U.btnTiny,
+                        onClick: () => setGenDel(item.file),
+                      }, '删除'),
+                  ]),
+                  h('div', { key: 'r2', style: U.hint }, [
+                    prettyDuration(item.durationMs),
+                    prettyBytes(item.bytes),
+                    item.engineKind,
+                    item.voice || '当前嗓子',
+                    item.style && item.style.emotion ? `情绪=${item.style.emotion}` : '',
+                    item.source === 'model' ? '模型生成' : '',
+                    String(item.at || '').replace('T', ' ').replace(/\..*$/, ''),
+                  ].filter(Boolean).join(' · ')),
+                  genRename.from === item.name ? h('div', { key: 'r3', style: rowStyle }, [
+                    h('input', {
+                      key: 'to',
+                      value: genRename.to,
+                      spellCheck: false,
+                      onChange: (event) => setGenRename({ from: item.name, to: event.target.value }),
+                      style: { ...INPUT_STYLE, flex: '1 1 180px' },
+                    }),
+                    h('button', {
+                      key: 'ok',
+                      type: 'button',
+                      style: U.btnTiny,
+                      onClick: async () => {
+                        const result = await genPost({ action: 'rename', from: item.name, to: genRename.to });
+                        if (result.ok) setGenRename({ from: '', to: '' });
+                      },
+                    }, '确定'),
+                    h('button', {
+                      key: 'cancel',
+                      type: 'button',
+                      style: U.btnTiny,
+                      onClick: () => setGenRename({ from: '', to: '' }),
+                    }, '取消'),
+                  ]) : null,
+                ])))
+              : hint('none', '还没有生成过。上面写一句、点「生成并播放」，文件就会落在输出目录里；模型生成的也会出现在这里（标「模型生成」）。'),
+          ]),
+        ]);
+      };
+
+      const enginePage = () => {
+        const info = engInfo;
+        const providers = (info && info.providers) || [];
+        const isBreeze = !info || info.active === 'breeze';
+        const items = (info && info.items) || [];
+        const form = engForm;
+        const rowStyle = { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' };
+
+        return h('div', { key: 'eng', style: { display: 'flex', flexDirection: 'column', gap: 12 } }, [
+          card('cur', [
+            cardHead('h', '当前引擎'),
+            hint('d', info
+              ? `正在用：${info.effective.label}（${info.effective.kind}）· ${info.effective.baseUrl}`
+              : '读取中…'),
+            info ? hint('k', info.keyBackend === 'credentials'
+              ? '密钥存放在 DSH 凭据库（不会写进 state.json，也不回显）'
+              : 'DSH 凭据库不可用，密钥暂存在本地 keys/ 目录') : null,
+            // §4.9：没有音色清单 → 说清楚「现在用谁 / 为什么藏了 / 想换怎么办」
+            (info && info.voiceMode === 'manual') ? hint('g', info.guidance, true) : null,
+            info ? divider('dv1') : null,
+            info ? h('div', { key: 'act', style: rowStyle }, [
+              h('button', {
+                key: 'try',
+                type: 'button',
+                style: U.btnTiny,
+                disabled: engBusy,
+                onClick: async () => {
+                  const result = await getJson('/voice-breeze/say', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ text: '这是当前引擎的试听。听得到就说明它活着。', session: store.sessionId }),
+                  });
+                  setEngMsg(result.ok ? '试听已发出' : `试听失败：${result.status || ''}`);
+                },
+              }, '用当前引擎念一句'),
+            ]) : null,
+            // （P4a）：把「当前引擎怎么写」摊开给用户看 —— 模型看的是同一份（`tts_state.enginePlaybook`）。
+            // 这是 E20 的缺口：数据一直在，只是没地方显示。
+            (info && Array.isArray(info.playbook) && info.playbook.length) ? h('details', {
+              key: 'pb',
+              style: { marginTop: 2 },
+            }, [
+              h('summary', {
+                key: 's',
+                style: { cursor: 'pointer', fontSize: 11.5, color: 'var(--dsw-alias-label-secondary)' },
+              }, `这个引擎怎么写才好听（${info.playbook.length} 条，点开看）`),
+              h('div', { key: 'b', style: { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 } },
+                info.playbook.map((line, i) => h('div', {
+                  key: `l${i}`,
+                  style: { fontSize: 11, lineHeight: 1.5, color: 'var(--dsw-alias-label-secondary)' },
+                }, `${i + 1}. ${line}`))),
+            ]) : null,
+          ]),
+
+          card('list', [
+            cardHead('h', '引擎列表'),
+            hint('d', '本机 BreezeTTS2 是内置的，删不掉；云端引擎可以随时加、改、切。'),
+            h('div', { key: 'items', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, [
+              // 本机那一行
+              h('div', { key: 'breeze', style: { ...rowStyle, justifyContent: 'space-between' } }, [
+                h('span', { key: 'n', style: { fontSize: 12 } }, `${isBreeze ? '● ' : '○ '}本机 BreezeTTS2`),
+                h('button', {
+                  key: 'use',
+                  type: 'button',
+                  disabled: engBusy || isBreeze,
+                  style: { ...U.btnTiny, opacity: isBreeze ? 0.4 : 1 },
+                  onClick: () => { void enginePost({ active: 'breeze' }); },
+                }, isBreeze ? '在用' : '启用'),
+              ]),
+              divider('dv2'),
+              providers.length ? providers.map((one) => h('div', {
+                key: one.id,
+                style: { display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 0' },
+              }, [
+                h('div', { key: 'top', style: { ...rowStyle, justifyContent: 'space-between' } }, [
+                  h('span', { key: 'n', style: { fontSize: 12 } },
+                    `${info && info.active === one.id ? '● ' : '○ '}${one.label || one.id}`),
+                  h('div', { key: 'btns', style: { display: 'flex', gap: 4 } }, [
+                    h('button', {
+                      key: 'use',
+                      type: 'button',
+                      disabled: engBusy || (info && info.active === one.id),
+                      style: { ...U.btnTiny, opacity: info && info.active === one.id ? 0.4 : 1 },
+                      onClick: () => { void enginePost({ active: one.id }); },
+                    }, info && info.active === one.id ? '在用' : '启用'),
+                    h('button', {
+                      key: 'edit',
+                      type: 'button',
+                      style: U.btnTiny,
+                      onClick: () => {
+                        setEngForm({
+                          id: one.id,
+                          label: one.label || one.id,
+                          baseUrl: one.baseUrl,
+                          model: one.model,
+                          apiKey: '',
+                          defaultVoice: one.defaultVoice || '',
+                          style: JSON.parse(JSON.stringify(one.style || {})),
+                          isNew: false,
+                        });
+                        setVoiceList(((one.items) || []).map((v) => ({ id: v, name: v })));
+                      },
+                    }, '编辑'),
+                    h('button', {
+                      key: 'del',
+                      type: 'button',
+                      style: { ...U.btnTiny, color: 'var(--dsw-alias-state-error-primary)' },
+                      onClick: () => { void removeEngine(one.id); },
+                      title: '删掉这条引擎（连它的密钥一起清掉）',
+                    }, '删除'),
+                  ]),
+                ]),
+                h('span', { key: 'meta', style: { ...U.hint, fontSize: 10.5 } },
+                  `${one.baseUrl} · ${one.model} · 密钥${one.keyPresent ? '已保存' : '未填'} · 音色${one.voiceMode === 'list' ? `可列（${one.items.length}）` : '该引擎不提供'}`),
+              ])) : hint('none', '还没有云端引擎，下面加一个。'),
+            ]),
+            engMsg ? h('div', { key: 'msg', style: { ...U.hint, color: 'var(--dsw-alias-label-primary)' } }, engMsg) : null,
+          ]),
+
+          card('form', [
+            cardHead('h', form && !form.isNew ? `编辑：${form.id}` : '新建云端引擎'),
+            hint('d', '选「OpenAI 兼容」类服务（OpenAI / 硅基流动 / Groq / MiniMax / 任意中转或自建网关）。baseUrl 写不写 /v1 都行。'),
+            h('div', { key: 'f', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+              h('input', {
+                key: 'id',
+                value: form ? form.id : '',
+                placeholder: 'id（字母 / 数字 / - / _，如 cloud-a）',
+                spellCheck: false,
+                disabled: Boolean(form && !form.isNew),
+                onChange: (event) => setEngForm({ ...(form || { isNew: true }), id: event.target.value }),
+                style: INPUT_STYLE,
+              }),
+              h('input', {
+                key: 'label',
+                value: form ? form.label : '',
+                placeholder: '显示名（如「某某云」）',
+                spellCheck: false,
+                onChange: (event) => setEngForm({ ...(form || { isNew: true }), label: event.target.value }),
+                style: INPUT_STYLE,
+              }),
+              h('input', {
+                key: 'base',
+                value: form ? form.baseUrl : '',
+                placeholder: 'baseUrl（如 https://api.openai.com/v1）',
+                spellCheck: false,
+                onChange: (event) => setEngForm({ ...(form || { isNew: true }), baseUrl: event.target.value }),
+                style: INPUT_STYLE,
+              }),
+              // 告诉用户这条会被识别成哪种接口（MiniMax 是专用形状，别的按 OpenAI 兼容走）
+              hint('kind', (() => {
+                let host = '';
+                try { host = new URL((form && form.baseUrl) || '').hostname.toLowerCase(); } catch { host = ''; }
+                return (host.includes('minimax') || host.includes('minimaxi'))
+                  ? '识别为：MiniMax 专用接口（/v1/t2a_v2，音色用 voice_id）'
+                  : '识别为：OpenAI 兼容接口（/v1/audio/speech）';
+              })()),
+              h('input', {
+                key: 'model',
+                value: form ? form.model : '',
+                placeholder: 'model（如 tts-1 / speech-02 / gpt-4o-mini-tts）',
+                spellCheck: false,
+                onChange: (event) => setEngForm({ ...(form || { isNew: true }), model: event.target.value }),
+                style: INPUT_STYLE,
+              }),
+              h('input', {
+                key: 'key',
+                type: 'password',
+                value: form ? form.apiKey : '',
+                placeholder: form && !form.isNew ? 'apiKey（留空 = 不改）' : 'apiKey',
+                spellCheck: false,
+                autoComplete: 'off',
+                onChange: (event) => setEngForm({ ...(form || { isNew: true }), apiKey: event.target.value }),
+                style: INPUT_STYLE,
+              }),
+              // 音色：**输入框永远在**（手填是最后一条路，`15` §4.7 第 2 条）。
+              // 不再用 `<datalist>` —— 浏览器会**按输入框当前值过滤选项**，
+              // 已经填了音色时点开只剩一条。改成独立的 `<select>`，
+              // 并且清单取**正在编辑的这个 provider**（原来错取了当前生效引擎的）。
+              h('div', { key: 'voice', style: { display: 'flex', flexDirection: 'column', gap: 4 } }, [
+                h('input', {
+                  key: 'in',
+                  value: form ? form.defaultVoice : '',
+                  placeholder: voiceList.length
+                    ? '默认音色（下面下拉里挑，也能自己打）'
+                    : '默认音色（可空；点「拉取清单」看看这家有哪些）',
+                  spellCheck: false,
+                  onChange: (event) => setEngForm({ ...(form || { isNew: true }), defaultVoice: event.target.value }),
+                  style: INPUT_STYLE,
+                }),
+                h('div', { key: 'pick', style: { display: 'flex', gap: 6, alignItems: 'center' } }, [
+                  h('select', {
+                    key: 'sel',
+                    value: '',
+                    disabled: !voiceList.length,
+                    style: { ...INPUT_STYLE, flex: '1 1 auto', minWidth: 0 },
+                    onChange: (event) => {
+                      const picked = event.target.value;
+                      if (!picked) return;
+                      setEngForm({ ...(form || { isNew: true }), defaultVoice: picked });
+                    },
+                  }, [
+                    h('option', { key: 'ph', value: '' },
+                      voiceList.length ? `（从 ${voiceList.length} 条里选一个）` : '（还没有清单）'),
+                    ...voiceList.map((v) => h('option', {
+                      key: v.id,
+                      value: v.id,
+                    }, v.name && v.name !== v.id ? `${v.name} · ${v.id}` : v.id)),
+                  ]),
+                  h('button', {
+                    key: 'fetch',
+                    type: 'button',
+                    disabled: engBusy || !form || !form.id,
+                    style: { ...U.btnTiny, opacity: form && form.id ? 1 : 0.5 },
+                    title: '向引擎要它的音色清单（MiniMax 有真接口，其余给预置）',
+                    onClick: async () => {
+                      if (!form || !form.id) { setEngMsg('先填 id（保存过一次才能拉清单）'); return; }
+                      const result = await getJson(`/voice-breeze/engine/voices?id=${encodeURIComponent(form.id)}`);
+                      if (result.ok && Array.isArray(result.data && result.data.items)) {
+                        setVoiceList(result.data.items);
+                        const remembered = Number(result.data && result.data.remembered) || 0;
+                        setEngMsg(result.data.items.length
+                          // 1.2.1：说清"已经记住了" —— 以前只存在这个页面的局部 state 里，
+                          // 生成页的音色下拉永远是空的（用户报的就是这个）。
+                          ? `拉到 ${result.data.items.length} 条音色${remembered ? `，已记住 ${remembered} 条（生成页的音色下拉会跟着更新）` : ''}`
+                          : '这家没有返回音色清单');
+                        // 让 `/engine` 快照跟着更新：生成页与「当前引擎」卡读的是它
+                        void loadEngine();
+                      } else {
+                        setEngMsg(`拉清单失败：${(result.data && result.data.error) || result.status || ''}`);
+                      }
+                    },
+                  }, '拉取清单'),
+                ]),
+              ]),
+              // ───────── （P2）：这一家的"风格" ─────────
+              // 口径：**只显示这家真认识的字段**（能力表在宿主侧，这里按 kind 粗判就够了）。
+              // 留空 = 用厂商默认；数值越界由宿主 `coerceStyle()` 夹到位，这里不做二次校验。
+              (() => {
+                let host = '';
+                try { host = new URL((form && form.baseUrl) || '').hostname.toLowerCase(); } catch { host = ''; }
+                const isMinimax = host.includes('minimax') || host.includes('minimaxi');
+                if (!isMinimax) return null;
+                const st = (form && form.style) || {};
+                const setStyle = (patch) => setEngForm({ ...(form || { isNew: true }), style: { ...st, ...patch } });
+                const setVm = (patch) => setStyle({ voiceModify: { ...(st.voiceModify || {}), ...patch } });
+                const numInput = (key, placeholder, value, onChange, width) => h('input', {
+                  key,
+                  value: value === undefined || value === null ? '' : String(value),
+                  placeholder,
+                  spellCheck: false,
+                  inputMode: 'decimal',
+                  onChange: (event) => onChange(event.target.value),
+                  style: { ...INPUT_STYLE, flex: `0 0 ${width || 62}px`, minWidth: 0, textAlign: 'center' },
+                });
+                return h('div', { key: 'style', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+                  hint('st', '风格（这家支持；留空 = 厂商默认）。情绪只影响这家的合成，切到别家自动不生效。'),
+                  h('div', { key: 'srow1', style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } }, [
+                    h('select', {
+                      key: 'emotion',
+                      value: st.emotion || '',
+                      onChange: (event) => setStyle({ emotion: event.target.value }),
+                      style: { ...INPUT_STYLE, flex: '1 1 120px', minWidth: 0 },
+                    }, [
+                      h('option', { key: '', value: '' }, '情绪：自动（推荐）'),
+                      ...['calm', 'happy', 'sad', 'angry', 'surprised', 'fearful', 'disgusted'].map((one) => h('option', { key: one, value: one }, `情绪：${one}`)),
+                    ]),
+                    h('select', {
+                      key: 'fx',
+                      value: (st.voiceModify && st.voiceModify.soundEffects) || '',
+                      onChange: (event) => setVm({ soundEffects: event.target.value }),
+                      style: { ...INPUT_STYLE, flex: '1 1 120px', minWidth: 0 },
+                    }, [
+                      h('option', { key: '', value: '' }, '音效：无'),
+                      h('option', { key: 'spacious_echo', value: 'spacious_echo' }, '音效：空旷回声'),
+                      h('option', { key: 'auditorium_echo', value: 'auditorium_echo' }, '音效：礼堂'),
+                      h('option', { key: 'lofi_telephone', value: 'lofi_telephone' }, '音效：电话'),
+                      h('option', { key: 'robotic', value: 'robotic' }, '音效：机器人'),
+                    ]),
+                  ]),
+                  h('div', { key: 'srow2', style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } }, [
+                    numInput('speed', '语速', st.speed, (v) => setStyle({ speed: v }), 58),
+                    numInput('vol', '音量', st.vol, (v) => setStyle({ vol: v }), 58),
+                    numInput('pitch', '音调', st.pitch, (v) => setStyle({ pitch: v }), 58),
+                    numInput('vmPitch', '低沉↔明亮', st.voiceModify && st.voiceModify.pitch, (v) => setVm({ pitch: v }), 82),
+                    numInput('vmInt', '有力↔柔和', st.voiceModify && st.voiceModify.intensity, (v) => setVm({ intensity: v }), 82),
+                    numInput('vmTimbre', '厚重↔清脆', st.voiceModify && st.voiceModify.timbre, (v) => setVm({ timbre: v }), 82),
+                  ]),
+                  hint('sh', '语速 0.5~2 · 音量 0.01~10 · 音调 ±12 · 调音台三项 ±100（0 = 不动）'),
+                  // （P4a）：两个可选项 —— 返回链接模式、要词级字幕
+                  h('div', { key: 'srow3', style: { display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' } }, [
+                    h('label', { key: 'url', style: { display: 'inline-flex', gap: 4, alignItems: 'center', fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, [
+                      h('input', {
+                        key: 'c',
+                        type: 'checkbox',
+                        checked: st.outputMode === 'url',
+                        onChange: (event) => setStyle({ outputMode: event.target.checked ? 'url' : '' }),
+                      }),
+                      '返回链接模式（省内存，长回复更划算）',
+                    ]),
+                    h('label', { key: 'sub', style: { display: 'inline-flex', gap: 4, alignItems: 'center', fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, [
+                      h('input', {
+                        key: 'c',
+                        type: 'checkbox',
+                        checked: st.subtitles === true,
+                        onChange: (event) => setStyle({ subtitles: event.target.checked }),
+                      }),
+                      '要词级字幕（多下一次 JSON）',
+                    ]),
+                  ]),
+                  // ───────── （P4a）：多音色混音 ─────────
+                  // 官方规则：最多 4 个、权重 1~100，混合时 `voice_id` 留空（lib 里已处理）。
+                  // 少于 2 条不生效，所以这里就按"要混就至少两条"来提示。
+                  (() => {
+                    const mixes = Array.isArray(st.timbreWeights) ? st.timbreWeights : [];
+                    const setMixes = (next) => setStyle({ timbreWeights: next.slice(0, 4) });
+                    const voiceOptions = voiceList.length
+                      ? voiceList
+                      : [{ id: (form && form.defaultVoice) || '', name: '（先拉一次清单）' }];
+                    return h('div', { key: 'mix', style: { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 2 } }, [
+                      h('div', { key: 'h', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
+                        h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                          `多音色混音（${mixes.length}/4，至少两条才生效）`),
+                        h('button', {
+                          key: 'add',
+                          type: 'button',
+                          disabled: mixes.length >= 4,
+                          style: { ...U.btnTiny, opacity: mixes.length >= 4 ? 0.4 : 1 },
+                          onClick: () => setMixes([...mixes, { voice_id: (voiceList[0] && voiceList[0].id) || '', weight: 50 }]),
+                        }, '＋ 加一个'),
+                      ]),
+                      ...mixes.map((one, i) => h('div', { key: `m${i}`, style: { display: 'flex', gap: 6, alignItems: 'center' } }, [
+                        h('select', {
+                          key: 'v',
+                          value: one.voice_id || '',
+                          style: { ...INPUT_STYLE, flex: '1 1 auto', minWidth: 0 },
+                          onChange: (event) => {
+                            const next = mixes.slice();
+                            next[i] = { ...one, voice_id: event.target.value };
+                            setMixes(next);
+                          },
+                        }, voiceOptions.map((v) => h('option', { key: v.id || v, value: v.id || v },
+                          v.name && v.name !== (v.id || v) ? `${v.name} · ${v.id}` : (v.id || v)))),
+                        h('input', {
+                          key: 'w',
+                          value: one.weight === undefined ? '' : String(one.weight),
+                          placeholder: '权重',
+                          spellCheck: false,
+                          inputMode: 'numeric',
+                          style: { ...INPUT_STYLE, flex: '0 0 62px', textAlign: 'center' },
+                          onChange: (event) => {
+                            const next = mixes.slice();
+                            next[i] = { ...one, weight: event.target.value };
+                            setMixes(next);
+                          },
+                        }),
+                        h('button', {
+                          key: 'x',
+                          type: 'button',
+                          style: U.btnTiny,
+                          onClick: () => setMixes(mixes.filter((_x, k) => k !== i)),
+                        }, '删'),
+                      ])),
+                    ]);
+                  })(),
+                ]);
+              })(),
+              h('div', { key: 'row', style: rowStyle }, [
+                h('button', {
+                  key: 'save',
+                  type: 'button',
+                  disabled: engBusy || !form,
+                  style: { ...U.btnPrimary, opacity: form ? 1 : 0.5 },
+                  onClick: () => { if (form) void submitEngine(form); },
+                }, '保存'),
+                form ? h('button', {
+                  key: 'cancel',
+                  type: 'button',
+                  style: U.btnTiny,
+                  onClick: () => { setEngForm(null); setEngMsg(''); },
+                }, '取消') : null,
+                !form ? h('button', {
+                  key: 'new',
+                  type: 'button',
+                  style: U.btnTiny,
+                  onClick: () => { setEngForm({ id: '', label: '', baseUrl: '', model: 'tts-1', apiKey: '', defaultVoice: '', style: {}, isNew: true }); setVoiceList([]); },
+                }, '新建一个') : null,
+              ]),
+            ]),
+          ]),
+        ]);
+      };
+
+
       return h('div', {
         'data-vb-panel': '',
         'data-vb-tip-scope': '',
@@ -1486,7 +3320,11 @@ window.__ModuleLoader__.load({
           left: shown.x,
           top: shown.y,
           width: PANEL_W,
-          zIndex: 60,
+          // 盖住 DSH 顶栏（原来是 60，被顶栏压住 → 拖到左上角就点不到了）
+          zIndex: Z_PANEL,
+          // macOS 下顶栏是 `-webkit-app-region: drag`，落在拖拽区里的点击会被系统吃掉；
+          // 这里显式声明本面板不是拖拽区（Windows 上无副作用）。
+          WebkitAppRegion: 'no-drag',
           display: 'flex',
           flexDirection: 'column',
           maxHeight: '78vh',
@@ -1554,7 +3392,7 @@ window.__ModuleLoader__.load({
             // 选中页签的浅灰块才能一直铺到那条线、和下方 2px 黑条接上
             boxShadow: 'inset 0 -1px 0 var(--dsw-alias-border-l2)',
           },
-        }, [['options', '选项'], ['global', '全局角色卡'], ['scenes', '场景']].map(([id, label]) => h('button', {
+        }, [['options', '选项'], ['global', '全局角色卡'], ['scenes', '场景'], ['gen', '生成'], ['engine', '引擎']].map(([id, label]) => h('button', {
           key: id,
           type: 'button',
           onClick: () => setTab(id),
@@ -1582,9 +3420,38 @@ window.__ModuleLoader__.load({
         h('div', {
           key: 'body',
           style: { padding: 12, display: 'flex', flexDirection: 'column', gap: 12, maxHeight: '62vh', overflowY: 'auto' },
-        }, [
+        }, safeParts(() => [
           // ───────── 选项页 ─────────
           tab === 'options' ? h('div', { key: 'opts', style: { display: 'flex', flexDirection: 'column', gap: 12 } }, [
+            /*
+             * 引擎没在跑时才出现（**只有本机 breeze 才有"启动进程"这回事**）。
+             * 判据用宿主给的 `engineKind` + `voiceUp`：云端引擎探活失败不该催用户去点启动。
+             */
+            (state.engineKind === 'breeze' && state.voiceUp === false) ? card('startengine', [
+              cardHead('h', 'BreezeTTS 引擎没在运行'),
+              hint('d', '播报、生成、变声都靠它。点下面的按钮启动，首次大约 10~20 秒；'
+                + '这段时间里排队的句子会在起来后自动补念。'),
+              h('div', { key: 'row', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+                (() => {
+                  const cooling = Date.now() - engineStartedAt < 20000;
+                  return h('button', {
+                    key: 'go',
+                    type: 'button',
+                    style: { ...U.btnPrimary, opacity: cooling ? 0.6 : 1 },
+                    disabled: cooling,
+                    onClick: async () => {
+                      if (cooling) return;
+                      setEngineStartedAt(Date.now());
+                      const res = await getJson('/voice-breeze/engine/start', { method: 'POST' });
+                      // 失败了就把冷却清掉，让用户能立刻再点（宿主那边还有闸门 + spawn 节流）
+                      if (!res.ok) setEngineStartedAt(0);
+                    },
+                  }, cooling ? '正在启动…' : '启动引擎');
+                })(),
+                h('span', { key: 'soft', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                  state.engineStarting ? '后台已经在拉了，起来后自动补念' : '也可以直接跟模型说话，模型念的时候会自动拉起'),
+              ]),
+            ]) : null,
             card('where', [
               cardHead('h', '选项位置'),
               hint('d', '决定「模式 / 强度 / 朗读 / 音色」选项位置在哪。'),
@@ -1648,6 +3515,40 @@ window.__ModuleLoader__.load({
               }),
             ]),
 
+            /*
+             * T5：**长播报切片**的开关。
+             *
+             * 为什么把这个旋钮交给用户：切片能消灭"生成慢于播放"的句中垫底（引擎是串行的，
+             * 整段 40 秒要等整段合成完才开口），但**每片单独合成，跨句韵律会被打断** ——
+             * 听感是主观的，值不值由用户定。0 = 不切（回到整段合成）。
+             * 交互照旧：改完 blur / 回车才落盘，拖动过程中不写盘。
+             */
+            card('chunk', [
+              cardHead('h', '长播报切片', h('span', {
+                key: 'v',
+                style: { fontSize: 11.5, fontWeight: 700, color: 'var(--dsw-alias-label-primary)' },
+              }, `${Number(shared.state && shared.state.chunkChars) || 0} 字`)),
+              hint('d', '把长句切成小片：B 片在合成时 A 片已经在播，机器忙时不会在句中垫底。'
+                + '代价是跨片韵律会被打断（每片重新起头），所以**默认关（0）**。'
+                + '**推荐 90** 够抗卡顿，又不至于一句一顿；填 0 = 不切。'),
+              h('div', { key: 'row', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
+                h('input', {
+                  key: 'n',
+                  type: 'number',
+                  min: 0,
+                  max: 400,
+                  step: 10,
+                  value: chunkDraft === null ? (Number(shared.state && shared.state.chunkChars) || 0) : chunkDraft,
+                  onChange: (event) => setChunkDraft(event.target.value),
+                  onBlur: commitChunk,
+                  onKeyUp: (event) => { if (event.key === 'Enter') commitChunk(); },
+                  style: { ...INPUT_STYLE, flex: '0 0 92px', textAlign: 'center' },
+                }),
+                h('span', { key: 't', style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                  '下一次播报就生效（不用重启）'),
+              ]),
+            ]),
+
             card('status', [
               cardHead('h', '当前状态'),
               // 横向排一行；圆点在文字右边；音色只给文字不给圆点
@@ -1674,6 +3575,9 @@ window.__ModuleLoader__.load({
           ]) : null,
 
           // ───────── 全局角色卡页 ─────────
+          tab === 'gen' ? genPage() : null,
+          tab === 'engine' ? enginePage() : null,
+
           tab === 'global' ? card('glob', [
             cardHead('h', '全局角色卡', h('button', {
               key: 'open',
@@ -2002,7 +3906,7 @@ window.__ModuleLoader__.load({
               ]),
             ]) : null,
           ]) : null,
-        ]),
+        ])),
       ]);
     }
 

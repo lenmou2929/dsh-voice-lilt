@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-lilt",
-  "version": "1.0.0",
+  "version": "1.2.5",
   "type": "module",
   "description": "让模型挑出要念的话，用本机或云端语音引擎念出来并在 DSH 窗口内播放；支持角色扮演、多角色分嗓音与情感陪伴",
   "license": "MIT",
@@ -20,6 +20,7 @@
     "host.mjs",
     "client.js",
     "lib/tts.mjs",
+    "lib/generated.mjs",
     "cordis.patch.yml",
     "locale/zh.json",
     "locale/en.json",

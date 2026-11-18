@@ -10,6 +10,7 @@
         seed: 42
         strength: 'medium'
         segmentGapMs: 500
+        chunkChars: 0         # T5：长播报切片片长（字）；0 = 不切（默认关）。想开推荐填 90
         bufferSeconds: 0
         maxChars: 240
         enabled: true
